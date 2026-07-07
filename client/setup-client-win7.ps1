@@ -1,965 +1,408 @@
 ﻿<#
 .SYNOPSIS
-     SMB 端口转发客户端 - Windows 7 专用版 (v3.1-win7)
+    SMBProxy - Windows 7 (v4.5 - 一端一网卡版)
 .DESCRIPTION
-     针对 Windows 7 SP1 (32/64位) 的完整兼容版本。
-     核心功能与 Win10/11 版完全一致。因为 Win7 缺少 NetAdapter / ScheduledTasks /
-     CIM / DnsClient 等模块, 本脚本全部替换为 WMI + netsh + schtasks。
-     
-     前提条件 (用户需自行安装):
-       - WMF 5.1 (PowerShell 5.1): https://aka.ms/wmf5download
-       - .NET Framework 4.8: https://dotnet.microsoft.com/download/dotnet-framework/net48
+    每条线路独立 KM-TEST Loopback Adapter (SMBProxy_1, SMBProxy_2...)
+    WMI + netsh 操作, schtasks 计划任务, 含离线依赖管理。
 #>
 
-# === PS 2.0 兼容: 内置 pause 不存在 ===
-function global:pause { $null = Read-Host "按 Enter 键继续..." }
-
-# === 管理员权限检测 (兼容 PS 2.0, 不用 #Requires) ===
 $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = New-Object Security.Principal.WindowsPrincipal($currentUser)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-Host "[错误] 请以管理员身份运行此脚本" -ForegroundColor Red
-    pause
-    exit 1
+    Write-Host "[错误] 请以管理员身份运行" -ForegroundColor Red; pause; exit 1
 }
-
 $ErrorActionPreference = "Stop"
+function global:pause { $null = Read-Host "按 Enter 键继续..." }
 
-# === 本地插件目录 (存放 .NET 和 WMF 离线安装包) ===
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $PluginDir = "$ScriptDir\win7plug"
+$ToolboxDir = "$env:ProgramData\SMBProxy"
+$ConfigPath = "$ToolboxDir\config.json"; $EnginePath = "$ToolboxDir\engine.ps1"; $LogPath = "$ToolboxDir\engine.log"
+$TaskName = "SMBProxy_Engine"; $LocalPort = 445; $FwPrefix = "SMBProxy-L7"
 
-# === 系统版本检测 ===
 $os = Get-WmiObject Win32_OperatingSystem
-$isWin7 = ($os.Version -like "6.1.*")
-if (-not $isWin7) {
-    Write-Host "====================================================" -ForegroundColor Red
-    Write-Host " [错误] 此脚本仅适用于 Windows 7" -ForegroundColor Red
-    Write-Host "  当前系统版本: $($os.Caption) ($($os.Version))" -ForegroundColor Yellow
-    Write-Host "  Windows 10/11 请使用 setup-client.ps1" -ForegroundColor Yellow
-    Write-Host "  Windows 8/8.1 请使用 setup-client-win8.ps1" -ForegroundColor Yellow
-    Write-Host "====================================================" -ForegroundColor Red
-    pause
-    exit 1
+if (-not ($os.Version -like "6.1.*")) {
+    Write-Host "[错误] 仅适用于 Windows 7, 当前: $($os.Caption)" -ForegroundColor Red; pause; exit 1
 }
-Write-Host "[系统] 检测到 $($os.Caption) — 使用 Win7 兼容模式" -ForegroundColor Cyan
+Write-Host "[系统] $($os.Caption) — Win7 模式" -ForegroundColor Cyan
 
-# === 自动启用 TLS 1.2 (Win7 默认禁用, 需手动打开 Schannel 开关) ===
+$osArchWmi = (Get-WmiObject Win32_OperatingSystem).OSArchitecture
+$is32Bit = ($osArchWmi -match "32")
+if ($is32Bit) { Write-Host "[信息] 32 位系统, 仅支持单线路" -ForegroundColor Yellow }
+
+# === TLS 1.2 ===
 function Enable-Tls12 {
-    # 在 Schannel 中启用 TLS 1.2 (客户端)
-    $p = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.2\Client"
-    if (-not (Test-Path $p)) { New-Item -Path $p -Force | Out-Null }
-    Set-ItemProperty -Path $p -Name "DisabledByDefault" -Value 0 -Type DWord -Force
-    Set-ItemProperty -Path $p -Name "Enabled" -Value 1 -Type DWord -Force
-    # 启用 TLS 1.1 作为备用
-    $p = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.1\Client"
-    if (-not (Test-Path $p)) { New-Item -Path $p -Force | Out-Null }
-    Set-ItemProperty -Path $p -Name "DisabledByDefault" -Value 0 -Type DWord -Force
-    Set-ItemProperty -Path $p -Name "Enabled" -Value 1 -Type DWord -Force
-    # 让 .NET/OS 使用 TLS 1.2
-    # SchUseStrongCrypto: CLR 2.0/4.0 强制使用系统 Schannel 设置
-    # SystemDefaultTlsVersions: .NET 4.7+ 使用系统默认 TLS 版本
-    $netPaths = @(
-        "HKLM:\SOFTWARE\Microsoft\.NETFramework\v4.0.30319",
-        "HKLM:\SOFTWARE\Microsoft\.NETFramework\v2.0.50727",
-        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\.NETFramework\v4.0.30319",
-        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\.NETFramework\v2.0.50727"
-    )
-    foreach ($np in $netPaths) {
-        Set-ItemProperty -Path $np -Name "SchUseStrongCrypto" -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
-        Set-ItemProperty -Path $np -Name "SystemDefaultTlsVersions" -Value 1 -Type DWord -Force -ErrorAction SilentlyContinue
+    $p1 = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.2\Client"
+    if (-not (Test-Path $p1)) { New-Item -Path $p1 -Force | Out-Null }
+    Set-ItemProperty -Path $p1 -Name "DisabledByDefault" -Value 0 -Type DWord -Force
+    Set-ItemProperty -Path $p1 -Name "Enabled" -Value 1 -Type DWord -Force
+    $p2 = "HKLM:\SYSTEM\CurrentControlSet\Control\SecurityProviders\SCHANNEL\Protocols\TLS 1.1\Client"
+    if (-not (Test-Path $p2)) { New-Item -Path $p2 -Force | Out-Null }
+    Set-ItemProperty -Path $p2 -Name "DisabledByDefault" -Value 0 -Type DWord -Force
+    Set-ItemProperty -Path $p2 -Name "Enabled" -Value 1 -Type DWord -Force
+    foreach ($np in @("HKLM:\SOFTWARE\Microsoft\.NETFramework\v4.0.30319","HKLM:\SOFTWARE\Microsoft\.NETFramework\v2.0.50727",
+                      "HKLM:\SOFTWARE\WOW6432Node\Microsoft\.NETFramework\v4.0.30319","HKLM:\SOFTWARE\WOW6432Node\Microsoft\.NETFramework\v2.0.50727")) {
+        Set-ItemProperty -Path $np -Name "SchUseStrongCrypto" -Value 1 -Type DWord -Force -ea SilentlyContinue
+        Set-ItemProperty -Path $np -Name "SystemDefaultTlsVersions" -Value 1 -Type DWord -Force -ea SilentlyContinue
     }
-    # WinHTTP 默认安全协议 (bitsadmin 下载时需要)
-    $winHttpPaths = @(
-        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\WinHttp",
-        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Internet Settings\WinHttp"
-    )
-    foreach ($wp in $winHttpPaths) {
+    foreach ($wp in @("HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Internet Settings\WinHttp",
+                      "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Internet Settings\WinHttp")) {
         if (-not (Test-Path $wp)) { New-Item -Path $wp -Force | Out-Null }
-        Set-ItemProperty -Path $wp -Name "DefaultSecureProtocols" -Value 0x00000A80 -Type DWord -Force -ErrorAction SilentlyContinue
+        Set-ItemProperty -Path $wp -Name "DefaultSecureProtocols" -Value 0x00000A80 -Type DWord -Force -ea SilentlyContinue
     }
 }
-Write-Host "[系统] 正在启用 TLS 1.2 支持..." -ForegroundColor Cyan
-try {
-    Enable-Tls12
-    Write-Host "[OK] TLS 1.2 已启用 (即时生效)" -ForegroundColor Green
-} catch {
-    Write-Host "[警告] TLS 1.2 启用失败: $($_.Exception.Message)" -ForegroundColor Yellow
-}
+Write-Host "[系统] 启用 TLS 1.2..." -ForegroundColor Cyan
+try { Enable-Tls12; Write-Host "[OK]" -ForegroundColor Green } catch { Write-Host "[警告] TLS 失败" -ForegroundColor Yellow }
 
-# === 统一下载函数 (绕过 Win7 .NET 3.5 的 TLS/证书限制) ===
+# === 下载函数 ===
 function Download-File {
     param($Urls, $DestPath)
     if ($Urls -is [string]) { $Urls = @($Urls) }
     if (Test-Path $DestPath) { Remove-Item $DestPath -Force }
-
     foreach ($Url in $Urls) {
-        # 方法1: MSXML2 ServerXMLHTTP (走 WinHTTP, 跳过证书校验)
-        $msxmlProgIDs = @("MSXML2.ServerXMLHTTP.6.0", "MSXML2.ServerXMLHTTP.3.0", "MSXML2.ServerXMLHTTP")
-        foreach ($progID in $msxmlProgIDs) {
-            try {
-                $http = New-Object -ComObject $progID -ErrorAction Stop
-                $http.setOption(2, 13056)
-                $http.open("GET", $Url, $false)
-                $http.setTimeouts(30000, 30000, 30000, 30000)
-                $http.send()
-                if ($http.status -eq 200) {
-                    [System.IO.File]::WriteAllBytes($DestPath, $http.responseBody)
-                    return $true
-                }
-            } catch {}
+        foreach ($p in @("MSXML2.ServerXMLHTTP.6.0","MSXML2.ServerXMLHTTP.3.0","MSXML2.ServerXMLHTTP")) {
+            try { $h = New-Object -ComObject $p -ea Stop; $h.setOption(2,13056); $h.open("GET",$Url,$false); $h.setTimeouts(30000,30000,30000,30000); $h.send()
+                if ($h.status -eq 200) { [System.IO.File]::WriteAllBytes($DestPath,$h.responseBody); return $true } } catch {}
         }
-        # 方法2: bitsadmin 备用
-        $dlCmd = "bitsadmin /transfer DL `"$Url`" `"$DestPath`""
-        cmd /c $dlCmd 2>&1 | Out-Null
+        cmd /c "bitsadmin /transfer DL `"$Url`" `"$DestPath`"" 2>&1 | Out-Null
         if (Test-Path $DestPath) { return $true }
     }
     return $false
 }
 
-# === 0. SHA-2 签名支持 (Win7 不原生支持 SHA-256 签名,
-#     不装这个后续 .NET 4.8 和 WMF 5.1 的安装包都无法运行) ===
-Write-Host "[系统] 检查 SHA-2 签名支持..." -ForegroundColor Cyan
-$osArch = (Get-WmiObject Win32_OperatingSystem).OSArchitecture
-$is64Bit = ($osArch -match "64")
-
+# === 依赖安装 ===
 $kbsNeeded = @()
-if (-not (Get-HotFix -Id KB4490628 -ErrorAction SilentlyContinue)) {
-    $kbsNeeded += @{ KB="KB4490628"; Desc="服务栈更新(双签名兼容)" }
-}
-if (-not (Get-HotFix -Id KB4474419 -ErrorAction SilentlyContinue)) {
-    $kbsNeeded += @{ KB="KB4474419"; Desc="SHA-2 签名支持" }
-}
-
+if (-not (Get-HotFix -Id KB4490628 -ea SilentlyContinue)) { $kbsNeeded += @{ KB="KB4490628"; Desc="服务栈更新" } }
+if (-not (Get-HotFix -Id KB4474419 -ea SilentlyContinue)) { $kbsNeeded += @{ KB="KB4474419"; Desc="SHA-2签名" } }
 if ($kbsNeeded.Count -gt 0) {
     Write-Host "====================================================" -ForegroundColor Red
-    Write-Host " [必须先装] SHA-2 签名支持补丁 (否则 .NET/WMF 无法安装)" -ForegroundColor Red
-    foreach ($k in $kbsNeeded) { Write-Host "  - 需要 $($k.KB) ($($k.Desc))" -ForegroundColor Yellow }
+    Write-Host " [前提] SHA-2 补丁" -ForegroundColor Red; foreach ($k in $kbsNeeded) { Write-Host "  - $($k.KB)" -ForegroundColor Yellow }
     Write-Host "====================================================" -ForegroundColor Red
-
-    $choice = Read-Host "是否从本地安装缺少的补丁? [Y] 是 [N] 手动下载 (默认Y)"
-    if ($choice -eq "" -or $choice -eq "Y" -or $choice -eq "y") {
-        $allOk = $true
+    $c = Read-Host "从本地安装? [Y] 是 [N] 手动下载 (默认Y)"
+    if ($c -eq "" -or $c -eq "Y" -or $c -eq "y") {
         foreach ($k in $kbsNeeded) {
-            $localMsu = Get-ChildItem $PluginDir -Filter "*$($k.KB)*.msu" -ErrorAction SilentlyContinue | Select-Object -First 1
-            Write-Host "`n正在安装 $($k.KB) ($($k.Desc))..." -ForegroundColor Cyan
-            if ($localMsu) {
-                $installer = "$env:TEMP\$($localMsu.Name)"
-                Write-Host "  [本地] 发现 $($localMsu.Name)" -ForegroundColor DarkCyan
-                Copy-Item $localMsu.FullName $installer -Force
-            } else {
-                Write-Host "  [错误] 未找到 $($k.KB) 的 .msu 文件, 请下载后放入:" -ForegroundColor Red
-                Write-Host "          $PluginDir" -ForegroundColor White
-                Write-Host "  下载: https://www.catalog.update.microsoft.com/Search.aspx?q=$($k.KB)" -ForegroundColor Gray
-                $allOk = $false
-                continue
-            }
-            Write-Host "  正在安装 (静默模式)..." -ForegroundColor DarkCyan
-            $result = Start-Process -FilePath "wusa.exe" -ArgumentList "`"$installer`" /quiet /norestart" -Wait -PassThru
-            if ($result.ExitCode -eq 0 -or $result.ExitCode -eq 3010) {
-                Write-Host "  [OK] $($k.KB) 安装完成" -ForegroundColor Green
-            } else {
-                Write-Host "  [警告] $($k.KB) 返回码: $($result.ExitCode)" -ForegroundColor Yellow
-            }
+            $msu = @(Get-ChildItem $PluginDir -Filter "*$($k.KB)*.msu" -ea SilentlyContinue)[0]
+            if ($msu) { $i="$env:TEMP\$($msu.Name)"; Copy-Item $msu.FullName $i -Force; Start-Process wusa.exe -ArgumentList "`"$i`" /quiet /norestart" -Wait }
+            else { Write-Host "[错误] 未找到 $($k.KB), 下载放入 $PluginDir" -ForegroundColor Red; pause; exit 1 }
         }
-        if (-not $allOk) {
-            Write-Host "[提示] 请下载上述补丁文件放入 win7plug 目录后重新运行" -ForegroundColor Yellow
-            pause
-            exit 1
-        }
-        Write-Host "[OK] SHA-2 补丁已安装, 继续检查下一项..." -ForegroundColor Green
-    } else {
-        Write-Host "`n请从以下地址下载并安装补丁后重新运行:" -ForegroundColor Yellow
-        foreach ($k in $kbsNeeded) {
-            Start-Process "https://www.catalog.update.microsoft.com/Search.aspx?q=$($k.KB)"
-        }
-        pause
-        exit 1
-    }
+        Write-Host "[OK] SHA-2 已安装, 继续..." -ForegroundColor Green
+    } else { foreach ($k in $kbsNeeded) { Start-Process "https://www.catalog.update.microsoft.com/Search.aspx?q=$($k.KB)" }; pause; exit 1 }
 }
-Write-Host "[OK] SHA-2 签名支持已就绪" -ForegroundColor Green
-
-# === 前提条件检查 (顺序重要: .NET 必须在 WMF 5.1 之前安装) ===
-
-# 1. 先检查 .NET Framework 4.5+ (WMF 5.1 的前置依赖, 必须先装)
-$netKey = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full" -ErrorAction SilentlyContinue
+$netKey = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full" -ea SilentlyContinue
 if (-not $netKey -or $netKey.Release -lt 378389) {
     Write-Host "====================================================" -ForegroundColor Red
-    Write-Host " [前提条件] 需要 .NET Framework 4.5 或更高版本" -ForegroundColor Red
-    Write-Host "  WMF 5.1 依赖 .NET 4.5+, 必须先安装此项" -ForegroundColor Yellow
+    Write-Host " [前提] .NET Framework 4.5+" -ForegroundColor Red
     Write-Host "====================================================" -ForegroundColor Red
-
-    $choice = Read-Host "是否自动下载并安装 .NET 4.8? [Y] 是 [N] 手动下载 (默认Y)"
-    if ($choice -eq "" -or $choice -eq "Y" -or $choice -eq "y") {
-        $localInstaller = "$PluginDir\ndp48-web.exe"
-        $installer = "$env:TEMP\ndp48-web.exe"
-        $needDownload = $true
-        if (Test-Path $localInstaller) {
-            Write-Host "  [本地] 发现 $localInstaller, 跳过下载" -ForegroundColor DarkCyan
-            Copy-Item $localInstaller $installer -Force
-            $needDownload = $false
+    $c = Read-Host "从本地安装 .NET 4.8? [Y] 是 [N] 手动下载 (默认Y)"
+    if ($c -eq "" -or $c -eq "Y" -or $c -eq "y") {
+        $lo = "$PluginDir\ndp48-web.exe"; $ins = "$env:TEMP\ndp48-web.exe"
+        if (Test-Path $lo) { Copy-Item $lo $ins -Force; Write-Host "[本地] 发现安装包" -ForegroundColor DarkCyan }
+        elseif (-not (Download-File -Urls @("https://go.microsoft.com/fwlink/?linkid=2088631") -DestPath $ins)) {
+            Write-Host "[错误] 下载失败, 放入 $PluginDir" -ForegroundColor Red; pause; exit 1
         }
-        if ($needDownload) {
-            Write-Host "`n正在下载 .NET Framework 4.8 Web 安装程序, 请稍候..." -ForegroundColor Cyan
-        }
-        try {
-            if ($needDownload) {
-                $netUrls = @(
-                    "https://go.microsoft.com/fwlink/?linkid=2088631",
-                    "https://download.visualstudio.microsoft.com/download/pr/2d6bb6b2-226a-4baa-bdec-798822606ff1/8494001c276a4b96804cde7829c04d7f/ndp48-web.exe"
-                )
-                if (-not (Download-File -Urls $netUrls -DestPath $installer)) {
-                    throw "下载失败, 请检查网络连接或手动下载"
-                }
-                Write-Host "  [OK] 下载完成" -ForegroundColor Green
-            }
-            Write-Host "  正在安装 (静默模式, 可能需要几分钟)..." -ForegroundColor DarkCyan
-            $result = Start-Process -FilePath $installer -ArgumentList "/q /norestart" -Wait -PassThru
-            if ($result.ExitCode -eq 0 -or $result.ExitCode -eq 3010) {
-                Write-Host "  [OK] .NET Framework 4.8 安装完成" -ForegroundColor Green
-            } else {
-                Write-Host "  [警告] 安装返回码: $($result.ExitCode)" -ForegroundColor Yellow
-            }
-        } catch {
-            Write-Host "  [错误] 下载或安装失败: $($_.Exception.Message)" -ForegroundColor Red
-            Write-Host "  请手动下载: https://dotnet.microsoft.com/download/dotnet-framework/net48" -ForegroundColor White
-        }
-    } else {
-        Write-Host "`n请手动下载并安装 .NET Framework 4.8:" -ForegroundColor Yellow
-        Write-Host "  https://dotnet.microsoft.com/download/dotnet-framework/net48" -ForegroundColor White
-        Start-Process "https://dotnet.microsoft.com/download/dotnet-framework/net48"
-        pause
-        exit 1
-    }
-    Write-Host "[OK] .NET 已安装, 继续检查下一项..." -ForegroundColor Green
+        Start-Process $ins -ArgumentList "/q /norestart" -Wait; Write-Host "[OK]" -ForegroundColor Green
+    } else { Start-Process "https://dotnet.microsoft.com/download/dotnet-framework/net48"; pause; exit 1 }
 }
-
-# 2. 再检查 PowerShell 5.1 / WMF 5.1 (依赖 .NET 4.5+)
-$psVersionOK = ($PSVersionTable.PSVersion.Major -ge 5)
-if (-not $psVersionOK) {
+if ($PSVersionTable.PSVersion.Major -lt 5) {
     Write-Host "====================================================" -ForegroundColor Red
-    Write-Host " [前提条件] 需要 PowerShell 5.1 (WMF 5.1)" -ForegroundColor Red
-    Write-Host "  当前版本: $($PSVersionTable.PSVersion)" -ForegroundColor Yellow
+    Write-Host " [前提] WMF 5.1 (当前: $($PSVersionTable.PSVersion))" -ForegroundColor Red
     Write-Host "====================================================" -ForegroundColor Red
-
-    $choice = Read-Host "是否自动下载并安装 WMF 5.1? [Y] 是 [N] 手动下载 (默认Y)"
-    if ($choice -eq "" -or $choice -eq "Y" -or $choice -eq "y") {
-        Write-Host "`n正在准备安装 WMF 5.1 ..." -ForegroundColor Cyan
-        $osArch = (Get-WmiObject Win32_OperatingSystem).OSArchitecture
-        if ($osArch -match "64") {
-            $msuName = "Win7AndW2K8R2-KB3191566-x64.msu"
-            $zipName = "Win7AndW2K8R2-KB3191566-x64.zip"
-            $wmfUrl = "https://download.microsoft.com/download/6/F/5/6F5FF66C-6775-42B0-86C4-47D41F2DA187/Win7AndW2K8R2-KB3191566-x64.msu"
-        } else {
-            $msuName = "Win7-KB3191566-x86.msu"
-            $zipName = "Win7-KB3191566-x86.zip"
-            $wmfUrl = "https://download.microsoft.com/download/6/F/5/6F5FF66C-6775-42B0-86C4-47D41F2DA187/Win7-KB3191566-x86.msu"
-        }
-        $localMsu = "$PluginDir\$msuName"
-        $localZip = "$PluginDir\$zipName"
-        $installer = "$env:TEMP\$msuName"
-        $needDownload = $true
-
-        # 1) 本地已有解压好的 .msu
-        if (Test-Path $localMsu) {
-            Write-Host "  [本地] 发现 $localMsu, 跳过下载" -ForegroundColor DarkCyan
-            Copy-Item $localMsu $installer -Force
-            $needDownload = $false
-        }
-        # 2) 本地有 .zip, 自动解压提取 .msu
+    $c = Read-Host "从本地安装 WMF 5.1? [Y] 是 [N] 手动下载 (默认Y)"
+    if ($c -eq "" -or $c -eq "Y" -or $c -eq "y") {
+        $arch = (Get-WmiObject Win32_OperatingSystem).OSArchitecture
+        $msuN = if ($arch -match "64") { "Win7AndW2K8R2-KB3191566-x64.msu" } else { "Win7-KB3191566-x86.msu" }
+        $zipN = if ($arch -match "64") { "Win7AndW2K8R2-KB3191566-x64.zip" } else { "Win7-KB3191566-x86.zip" }
+        $localMsu = "$PluginDir\$msuN"; $localZip = "$PluginDir\$zipN"; $installer = "$env:TEMP\$msuN"
+        $found = $false
+        if (Test-Path $localMsu) { Copy-Item $localMsu $installer -Force; $found = $true }
         elseif (Test-Path $localZip) {
-            Write-Host "  [本地] 发现 $localZip, 正在解压..." -ForegroundColor DarkCyan
-            $extractDir = "$env:TEMP\wmf_extract"
-            if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force }
-            New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
-            try {
-                $shell = New-Object -ComObject Shell.Application
-                $zip = $shell.NameSpace($localZip)
-                $dest = $shell.NameSpace($extractDir)
-                $dest.CopyHere($zip.Items(), 16)
-                # 等待解压完成
-                for ($i = 0; $i -lt 30; $i++) {
-                    Start-Sleep -Milliseconds 500
-                    $extracted = Get-ChildItem $extractDir -Filter "*.msu" -ErrorAction SilentlyContinue | Select-Object -First 1
-                    if ($extracted) { break }
-                }
-                if ($extracted) {
-                    Copy-Item $extracted.FullName $localMsu -Force
-                    Copy-Item $extracted.FullName $installer -Force
-                    Write-Host "  [OK] 已解压 $msuName 到本地插件目录" -ForegroundColor Green
-                    $needDownload = $false
-                }
-            } catch {}
-            if (Test-Path $extractDir) { Remove-Item $extractDir -Recurse -Force }
+            $ed = "$env:TEMP\wmf_e"; if (Test-Path $ed) { Remove-Item $ed -Recurse -Force }; New-Item -ItemType Directory $ed -Force | Out-Null
+            try { $sh = New-Object -ComObject Shell.Application; $sh.NameSpace($ed).CopyHere($sh.NameSpace($localZip).Items(),16)
+                for ($i=0;$i -lt 30;$i++) { Start-Sleep -Milliseconds 500; $ex = @(Get-ChildItem $ed -Filter "*.msu" -ea SilentlyContinue)[0]; if ($ex) { break } }
+                if ($ex) { Copy-Item $ex.FullName $installer -Force; $found = $true } } catch {}
+            if (Test-Path $ed) { Remove-Item $ed -Recurse -Force }
         }
-
-        # 3) 本地没有, 尝试下载
-        if ($needDownload) {
-            Write-Host "  本地未找到, 正在下载..." -ForegroundColor DarkCyan
-        }
-        try {
-            if ($needDownload) {
-                if (-not (Download-File -Urls @($wmfUrl) -DestPath $installer)) {
-                    throw "下载失败, 请检查网络连接或手动下载"
-                }
-                Write-Host "  [OK] 下载完成" -ForegroundColor Green
-            }
-            Write-Host "  正在安装 (静默模式)..." -ForegroundColor DarkCyan
-            $result = Start-Process -FilePath "wusa.exe" -ArgumentList "`"$installer`" /quiet /norestart" -Wait -PassThru
-            if ($result.ExitCode -eq 0 -or $result.ExitCode -eq 3010) {
-                Write-Host "  [OK] WMF 5.1 安装完成" -ForegroundColor Green
-            } else {
-                Write-Host "  [警告] 安装返回码: $($result.ExitCode)" -ForegroundColor Yellow
-            }
-        } catch {
-            Write-Host "  [错误] 下载或安装失败: $($_.Exception.Message)" -ForegroundColor Red
-            Write-Host "  请手动下载: https://www.microsoft.com/en-us/download/details.aspx?id=54616" -ForegroundColor White
-            Write-Host "  或将下载的 .msu/.zip 放入: $PluginDir" -ForegroundColor White
-        }
-    } else {
-        Write-Host "`n请手动下载并安装 WMF 5.1:" -ForegroundColor Yellow
-        Write-Host "  https://www.microsoft.com/en-us/download/details.aspx?id=54616" -ForegroundColor White
-        Start-Process "https://www.microsoft.com/en-us/download/details.aspx?id=54616"
-    }
-    Write-Host "[重要] 全部前置依赖已安装, 请重启电脑后重新运行此脚本" -ForegroundColor Yellow
-    pause
-    exit 1
+        if (-not $found) { Write-Host "[错误] 未找到 WMF 5.1, 放入 $PluginDir" -ForegroundColor Red; pause; exit 1 }
+        Start-Process wusa.exe -ArgumentList "`"$installer`" /quiet /norestart" -Wait
+        Write-Host "[重要] 全部依赖已安装, 请重启" -ForegroundColor Yellow; pause; exit 1
+    } else { Start-Process "https://www.microsoft.com/en-us/download/details.aspx?id=54616"; pause; exit 1 }
 }
 
-$TaskName = "SMBForword_Client_Core"
-if (-not $env:ProgramData) { $PSToolboxPath = "C:\ProgramData\SMBForword" } else { $PSToolboxPath = "$env:ProgramData\SMBForword" }
-$CoreScriptPath = "$PSToolboxPath\SMBForword_Core.ps1"
-$ConfigPath = "$PSToolboxPath\config.json"
-$LogPath = "$PSToolboxPath\engine.log"
-$LocalPort = 445
-$VirtualIP = "10.10.10.10"
-$FirewallRuleName = "SMBForword-Client-Local-445"
-$AdapterName = "SMBProxy"
-
-# === 通用辅助函数 ===
-function Get-WmiAdapter {
-    param([string]$Name)
-    if ($Name) {
-        return Get-WmiObject Win32_NetworkAdapter -ErrorAction SilentlyContinue | Where-Object { $_.NetConnectionID -eq $Name } | Select-Object -First 1
-    }
+# === 配置读写 ===
+function Read-Config {
+    if (-not (Test-Path $ConfigPath)) { return @() }
+    try {
+        $raw = [System.IO.File]::ReadAllText($ConfigPath, [System.Text.Encoding]::UTF8)
+        if (-not $raw.Trim()) { return @() }
+        $data = $raw | ConvertFrom-Json
+        if ($data -is [array]) { return @($data) }
+        return @($data)
+    } catch { return @() }
+}
+function Save-Config($C) {
+    if (-not (Test-Path $ToolboxDir)) { New-Item -ItemType Directory $ToolboxDir -Force | Out-Null }
+    $json = ConvertTo-Json -InputObject $C -Depth 2
+    $tmp = "$ConfigPath.tmp"
+    $json | Set-Content $tmp -Force
+    Move-Item $tmp $ConfigPath -Force -ErrorAction SilentlyContinue
+}
+function Get-NextIP {
+    $lines = @(Read-Config); $used = @($lines | % { $_.IP })
+    for ($i = 10; $i -le 254; $i++) { $ip = "10.10.10.$i"; if ($used -notcontains $ip) { return $ip } }
     return $null
 }
+function New-LineId { $l = @(Read-Config); $m = 0; foreach ($x in $l) { $n = 0; if ([int]::TryParse($x.Id, [ref]$n) -and $n -gt $m) { $m = $n } }; return [string]($m + 1) }
 
-function Get-WmiAdapterByDesc {
-    param([string]$Pattern)
-    return Get-WmiObject Win32_NetworkAdapter -ErrorAction SilentlyContinue | Where-Object {
-        ($_.Description -like $Pattern) -and $_.NetConnectionID
-    } | Select-Object -First 1
+# === 一端一网卡 (WMI + netsh) ===
+function Get-AdapterById($id) {
+    Get-WmiObject Win32_NetworkAdapter -ea SilentlyContinue | Where-Object { $_.NetConnectionID -eq "SMBProxy_$id" } | Select -First 1
+}
+function Rename-Adapter-Netsh($o, $n) { netsh interface set interface name="$o" newname="$n" 2>&1 | Out-Null; return ($LASTEXITCODE -eq 0) }
+function Enable-AdapterFn($id) {
+    $na = Get-AdapterById $id; if ($na -and $na.NetConnectionStatus -ne 2) { $na.Enable() | Out-Null; Start-Sleep -Seconds 1 }
+}
+function Create-AdapterForLine($id) {
+    $na = Get-AdapterById $id; if ($na) { Enable-AdapterFn $id; return $na.Index }
+    $match = Get-WmiObject Win32_NetworkAdapter -ea SilentlyContinue | Where-Object {
+        ($_.Description -like "*Loopback*" -or $_.Description -like "*环回*" -or $_.Description -like "*KM-TEST*") -and
+        $_.NetConnectionID -notlike "Loopback Pseudo-Interface*" -and $_.NetConnectionID -notlike "SMBProxy_*" -and $_.NetConnectionID
+    } | Select -First 1
+    if ($match) {
+        Write-Host "[信息] 复用 Loopback: $($match.NetConnectionID) -> SMBProxy_$id" -ForegroundColor DarkCyan
+        Rename-Adapter-Netsh $match.NetConnectionID "SMBProxy_$id" | Out-Null
+        $na = Get-AdapterById $id; if ($na) { Enable-AdapterFn $id; return $na.Index }
+    }
+    Write-Host "`n============================================================" -ForegroundColor Yellow
+    Write-Host "  为线路 $id 创建 SMBProxy_$id (仅一次):" -ForegroundColor Yellow
+    Write-Host "  1. 弹出窗口点 [下一步]" -ForegroundColor White
+    Write-Host "  2. [安装我手动从列表选择的硬件] -> [下一步]" -ForegroundColor White
+    Write-Host "  3. [网络适配器] -> [下一步]" -ForegroundColor White
+    Write-Host "  4. 厂商 [Microsoft], [Microsoft Loopback Adapter]" -ForegroundColor White
+    Write-Host "     (若没有则选 [Microsoft KM-TEST Loopback Adapter])" -ForegroundColor Gray
+    Write-Host "  5. [下一步] -> [下一步] -> 完成 -> 回本窗口按任意键" -ForegroundColor White
+    Write-Host "============================================================" -ForegroundColor Yellow
+    $snap = @(Get-WmiObject Win32_NetworkAdapter -ea SilentlyContinue | % { $_.PNPDeviceID })
+    Start-Process hdwwiz.exe; pause
+    for ($i = 0; $i -lt 15; $i++) {
+        Start-Sleep -Seconds 1
+        $all = @(Get-WmiObject Win32_NetworkAdapter -ea SilentlyContinue)
+        $new = $all | Where-Object { ($snap -notcontains $_.PNPDeviceID) -and $_.NetConnectionID -and $_.NetConnectionID -notlike "SMBProxy_*" } | Select -First 1
+        if ($new) {
+            Write-Host "[信息] 发现: $($new.NetConnectionID)" -ForegroundColor DarkCyan
+            Rename-Adapter-Netsh $new.NetConnectionID "SMBProxy_$id" | Out-Null; break
+        }
+        if (Get-AdapterById $id) { break }
+    }
+    $na = Get-AdapterById $id
+    if ($na) { Enable-AdapterFn $id; Write-Host "[OK] SMBProxy_$id 就绪" -ForegroundColor Green; return $na.Index }
+    Write-Host "[错误] 创建失败" -ForegroundColor Red; return $null
+}
+function Remove-AdapterForLine($id) {
+    $na = Get-AdapterById $id; if (-not $na) { return }
+    netsh interface ip delete address name="SMBProxy_$id" addr=all 2>$null | Out-Null
+    try { $na.Disable() | Out-Null } catch {}
+    Write-Host "[OK] SMBProxy_$id IP 已移除" -ForegroundColor Green
+    Write-Host "  [提示] 如设备未自动删除, 请在设备管理器中:" -ForegroundColor Yellow
+    Write-Host "    右键 SMBProxy_$id → 卸载设备 → 确定" -ForegroundColor Gray
+}
+function Add-AdapterIP($id, $ip) {
+    $c = netsh interface ip show addresses "SMBProxy_$id" 2>$null | Out-String
+    if ($c -match [regex]::Escape($ip)) { return }
+    netsh interface ip add address name="SMBProxy_$id" addr=$ip mask=255.255.255.255 2>&1 | Out-Null
+}
+function Remove-AdapterIP($id) {
+    netsh interface ip delete address name="SMBProxy_$id" addr=all 2>$null | Out-Null
 }
 
+# === 防火墙逐条 (netsh) ===
+function Setup-Firewall {}
+function Add-Firewall($id, $ip) { netsh advfirewall firewall add rule name="$FwPrefix-$id" dir=in action=allow protocol=TCP localport=$LocalPort localip=$ip | Out-Null }
+function Remove-Firewall($id) { netsh advfirewall firewall delete rule name="$FwPrefix-$id" 2>$null | Out-Null }
+function Remove-FirewallAll { $l=@(Read-Config);foreach($x in $l){netsh advfirewall firewall delete rule name="$FwPrefix-$($x.Id)" 2>$null|Out-Null} }
+
+# === SMB ===
+function Test-SmbDisabled { $s=Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\srvnet" -Name "Start" -ea SilentlyContinue; return ($s -and $s.Start -eq 4) }
+function Disable-SmbAndFastBoot {
+    Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\srvnet" -Name "Start" -Value 4 -Force
+    Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\smbdevice" -Name "Start" -Value 4 -Force -ea SilentlyContinue
+    Set-Service LanmanServer -StartupType Disabled; try { Stop-Service LanmanServer -Force -ea SilentlyContinue } catch {}
+    $hb=Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" -Name "HiberbootEnabled" -ea SilentlyContinue
+    if (-not $hb -or $hb.HiberbootEnabled -ne 0) { Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" -Name "HiberbootEnabled" -Value 0 -Force }
+    Write-Host "==========================================================" -ForegroundColor Red
+    Write-Host " [重要] 请重启电脑后重新运行" -ForegroundColor Yellow
+    Write-Host "==========================================================" -ForegroundColor Red; pause; exit 1
+}
+function Restore-Smb {
+    Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\srvnet" -Name "Start" -Value 3 -Force
+    Set-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\smbdevice" -Name "Start" -Value 3 -Force -ea SilentlyContinue
+    Set-Service LanmanServer -StartupType Automatic; try { Start-Service LanmanServer -ea SilentlyContinue } catch {}
+}
+
+# === 进程 (WMI) ===
+function Get-EngineProcess { Get-WmiObject Win32_Process -Filter "Name='powershell.exe'" -ea SilentlyContinue | Where-Object { $_.CommandLine -like "*$EnginePath*" } }
+function Stop-Engine { $p=Get-EngineProcess;foreach($x in $p){try{Stop-Process -Id $x.ProcessId -Force -ea SilentlyContinue}catch{}};if($p){Start-Sleep -Milliseconds 800};$retry=0;while((Get-EngineProcess) -and $retry -lt 5){Start-Sleep -Milliseconds 500;$retry++} }
+function Start-Engine { Stop-Engine;$l=@(Read-Config);if($l.Count -eq 0){return};Write-EngineScript;Setup-Task;Start-Process powershell.exe -Arg "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$EnginePath`"" -WindowStyle Hidden }
+function Setup-Task { $c=cmd /c "schtasks /query /tn `"$TaskName`" /fo csv /nh 2>nul" 2>$null;if($LASTEXITCODE -eq 0){return};$a="powershell.exe -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$EnginePath`"";cmd /c "schtasks /create /tn `"$TaskName`" /tr `"$a`" /sc onstart /ru SYSTEM /rl HIGHEST /delay 00:20 /f 2>&1"|Out-Null }
+function Remove-Task { $c=cmd /c "schtasks /query /tn `"$TaskName`" /fo csv /nh 2>nul" 2>$null;if($LASTEXITCODE -eq 0){cmd /c "schtasks /delete /tn `"$TaskName`" /f 2>nul" 2>$null|Out-Null} }
+
+# === 引擎 ===
+function Write-EngineScript {
+    $h=@"
+`$ConfigPath='$ConfigPath';`$LogPath='$LogPath';`$LocalPort=$LocalPort
+"@
+    $b=@'
+$ErrorActionPreference="SilentlyContinue"
+function Write-Log($m){$l="[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"),$m;try{Add-Content $LogPath $l -Encoding UTF8}catch{}}
+function DNS($d){try{$ar=[System.Net.Dns]::BeginGetHostAddresses($d,$null,$null);if(-not$ar.AsyncWaitHandle.WaitOne(5000)){return $null};$a=[System.Net.Dns]::EndGetHostAddresses($ar);$v6=$a|?{$_.AddressFamily -eq'InterNetworkV6'}|select -First 1;if($v6){return @{IP=$v6.IPAddressToString;Family=$v6.AddressFamily}};$v4=$a|?{$_.AddressFamily -eq'InterNetwork'}|select -First 1;if($v4){return @{IP=$v4.IPAddressToString;Family=$v4.AddressFamily}}}catch{};return $null}
+function Pump($a,$b){try{$as=$a.GetStream();$bs=$b.GetStream();$t=$as.CopyToAsync($bs,65536);$cb={param($x)try{$a.GetStream().Close()}catch{}try{$a.Close()}catch{}try{$b.GetStream().Close()}catch{}try{$b.Close()}catch{}}.GetNewClosure();$t.ContinueWith([Action[Threading.Tasks.Task]]$cb)|Out-Null}catch{try{$a.Close()}catch{}try{$b.Close()}catch{}}}
+Write-Log "===== SMBProxy v4.5 ====="
+$L=@{};$lastCheck=(Get-Date).AddDays(-1);$lastLogClean=Get-Date
+while($true){try{$now=Get-Date
+    if(($now-$lastCheck).TotalSeconds -ge 10){
+        $cfg=@()
+        try{$raw=Get-Content $ConfigPath -Raw -ErrorAction Stop;$obj=$raw|ConvertFrom-Json;if($obj -is [System.Array]){$cfg=@($obj)}else{$cfg=@($obj)}}catch{Write-Log("[配置读取失败] $($_.Exception.Message)")}
+        $live=@($cfg|%{$_.IP})
+        foreach($ip in @($L.Keys)){if($ip -notin $live){try{$L[$ip].Listener.Stop()}catch{};$L.Remove($ip);Write-Log("[下线] $ip")}}
+        foreach($line in $cfg){
+            if(-not$line -or -not$line.IP){continue}
+            if($line.IP -is [array]){Write-Log("[忽略异常IP数组] $($line.IP -join ',')");continue}
+            $ipText=([string]$line.IP).Trim()
+            try{$check=[System.Net.IPAddress]::Parse($ipText);if($check.AddressFamily -ne "InterNetwork"){continue}}catch{Write-Log("[忽略非法配置IP] $ipText");continue}
+            if(-not$L.ContainsKey($line.IP)){
+                $ln=$null;for($r=0;$r -lt 3;$r++){try{$ln=New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Parse($line.IP),$LocalPort);$ln.Start();break}catch{if($r -lt 2){Start-Sleep -Seconds 2}}}
+                if($ln){$L[$line.IP]=@{Listener=$ln;Line=$line;Endpoint=$null;LastResolve=(Get-Date).AddDays(-1)};Write-Log("[上线] {0}:{1} -> {2}:{3}" -f $line.IP,$LocalPort,$line.Domain,$line.Port)}else{Write-Log("[监听失败] $ipText 三次重试后仍无法绑定")}
+            }
+        }$lastCheck=Get-Date
+    }
+    if(($now-$lastLogClean).TotalHours -ge 1){try{if((Get-Item $LogPath -ea Stop).Length -gt 5MB){Set-Content $LogPath "[{0}] 日志滚动 - 已截断" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss") -Encoding UTF8}}catch{};$lastLogClean=Get-Date}
+    foreach($ip in @($L.Keys)){$e=$L[$ip];if(($now-$e.LastResolve).TotalSeconds -ge 60){$ep=DNS $e.Line.Domain;if($ep){$e.Endpoint=$ep};$e.LastResolve=Get-Date;break}}
+    foreach($ip in @($L.Keys)){$e=$L[$ip];if(-not$e.Listener.Pending()){continue};if(-not$e.Endpoint){continue};$c=$e.Listener.AcceptTcpClient()
+        try{$r=New-Object System.Net.Sockets.TcpClient($e.Endpoint.Family);$ar=$r.BeginConnect($e.Endpoint.IP,$e.Line.Port,$null,$null);if(-not$ar.AsyncWaitHandle.WaitOne(5000)){throw"连接远程超时"};$r.EndConnect($ar);Write-Log("[连接] {0} -> {1}:{2}" -f $e.Line.Domain,$e.Endpoint.IP,$e.Line.Port);Pump $c $r;Pump $r $c}catch{try{$c.Close()}catch{}}
+    }
+    Start-Sleep -Milliseconds 200
+}catch{try{Write-Log("[致命异常] $($_.Exception.Message)")}catch{};Start-Sleep -Seconds 2}}
+'@
+    if(-not(Test-Path $ToolboxDir)){New-Item -ItemType Directory $ToolboxDir -Force|Out-Null}
+    $h+"`r`n"+$b | Set-Content $EnginePath -Force -Encoding UTF8
+}
+
+# === 线路 ===
+function Add-Line {
+    if ($is32Bit) { $l = @(Read-Config); if ($l.Count -ge 1) { Write-Host "[限制] 32 位系统仅支持 1 条线路" -ForegroundColor Yellow; pause; return } }
+    $domain = Read-Host "`n输入远程 DDNS 域名"; if (-not $domain) { Write-Host "已取消" -ForegroundColor Gray; return }
+    $ps=Read-Host "输入远程端口号 (默认 1445)";$port=1445;if($ps){[int]::TryParse($ps,[ref]$port)|Out-Null}
+    if ($port -lt 1 -or $port -gt 65535) { Write-Host "端口无效" -ForegroundColor Red; return }
+    $ip = Get-NextIP; if (-not $ip) { Write-Host "[错误] 无可用 IP" -ForegroundColor Red; return }
+    $id=New-LineId
+    $ifIdx = Create-AdapterForLine $id; if (-not $ifIdx) { Write-Host "[错误] 网卡创建失败" -ForegroundColor Red; return }
+    Add-AdapterIP $id $ip;Add-Firewall $id $ip
+    $l=@(Read-Config);$l+=@{Id=$id;IP=$ip;Domain=$domain;Port=$port};Save-Config $l
+    Write-Host "[OK] 线路已添加: $id  $ip  SMBProxy_$id  $domain`:$port" -ForegroundColor Green
+    Start-Engine
+    pause
+}
+function Remove-Line {
+    $l=@(Read-Config);if($l.Count -eq 0){return}
+    $id = Read-Host "`n输入要删除的线路 ID"; if (-not $id) { return }
+    $m = $l | Where-Object { $_.Id -eq $id }; if (-not $m) { Write-Host "[错误] 未找到 ID: $id" -ForegroundColor Red; return }
+    Remove-AdapterForLine $id;Remove-Firewall $id
+    $l=@($l|Where-Object{$_.Id -ne $id});Save-Config $l
+    Write-Host "[OK] 线路已删除: $id" -ForegroundColor Green
+    if ($l.Count -eq 0) { Stop-Engine } else { Start-Engine }
+    pause
+}
+function Full-Uninstall {
+    Write-Host "`n正在完全卸载..." -ForegroundColor Yellow; Remove-Task; Stop-Engine; Remove-FirewallAll
+    $l = @(Read-Config); foreach ($x in $l) { Remove-AdapterForLine $x.Id }
+    $remains = @(Get-WmiObject Win32_NetworkAdapter -ea SilentlyContinue | Where-Object { $_.NetConnectionID -like "SMBProxy_*" })
+    if ($remains.Count -gt 0) {
+        Write-Host "`n  [提示] 以下网卡未能自动删除, 请在设备管理器中手动操作:" -ForegroundColor Yellow
+        foreach ($r in $remains) { Write-Host "    右键 $($r.NetConnectionID) → 卸载设备 → 确定" -ForegroundColor Gray }
+    }
+    Restore-Smb; Start-Sleep -Seconds 1
+    if (Test-Path $ToolboxDir) { Remove-Item $ToolboxDir -Recurse -Force -ErrorAction SilentlyContinue }
+    if (Test-Path $ToolboxDir) { Write-Host "  [提示] 请手动删除: $ToolboxDir" -ForegroundColor Yellow }
+    Write-Host "[OK] 卸载完成, 建议重启" -ForegroundColor Green; pause; exit
+}
+
+# === 菜单 ===
 function Show-Menu {
     Clear-Host
     Write-Host "====================================================" -ForegroundColor Cyan
-    Write-Host "     SMB 端口转发 - 客户端菜单 (v3.1-Win7)         " -ForegroundColor Cyan
+    Write-Host "     SMBProxy - Windows 7 (v4.5)                   " -ForegroundColor Cyan
     Write-Host "====================================================" -ForegroundColor Cyan
-    Write-Host "  入口地址: \\$VirtualIP" -ForegroundColor Green
-    Write-Host ""
-
-    $taskResult = cmd /c "schtasks /query /tn `"$TaskName`" /fo csv /nh 2>nul" 2>$null
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "  [状态] 后台任务: 已安装" -ForegroundColor Green
-        $proc = Get-CoreEngineProcess
-        if ($proc) {
-            Write-Host "  [状态] 核心引擎: 运行中 (PID: $($proc.ProcessId))" -ForegroundColor Green
-        } else {
-            Write-Host "  [状态] 核心引擎: 已停止" -ForegroundColor Yellow
-        }
-    } else {
-        Write-Host "  [状态] 后台任务: 未安装" -ForegroundColor Gray
-    }
-    Write-Host ""
-
-    Write-Host "[1] 安装/更新 远程代理 (首次使用选这个)" -ForegroundColor Green
-    Write-Host "[2] 停止代理并恢复本机SMB" -ForegroundColor Yellow
-    Write-Host "[3] 查看运行日志 (排障用)" -ForegroundColor Cyan
-    Write-Host "[4] 退出" -ForegroundColor Gray
+    $procs = Get-EngineProcess
+    if ($procs) { Write-Host "  引擎: 运行中 (PID: $($procs[0].ProcessId))" -ForegroundColor Green }
+    else { Write-Host "  引擎: 已停止" -ForegroundColor Yellow }
+    $l = @(Read-Config)
+    Write-Host "`n  ID   Adapter          VirtualIP        Domain:Port" -ForegroundColor DarkCyan
+    Write-Host "  ----  ───────────────  ──────────────   ──────────────────" -ForegroundColor DarkCyan
+    if ($l.Count -eq 0) { Write-Host "  (暂无线路)" -ForegroundColor Gray }
+    else { foreach ($x in $l) { Write-Host ("  {0,-5} SMBProxy_{0,-8} {1,-16} {2}:{3}" -f $x.Id, $x.IP, $x.Domain, $x.Port) -ForegroundColor White } }
+    Write-Host "`n  线路: $($l.Count)" -ForegroundColor Gray; Write-Host ""
+    Write-Host "[1] 添加线路 (手动创建网卡)" -ForegroundColor Green
+    Write-Host "[2] 删除线路 (自动移除网卡)" -ForegroundColor Yellow
+    Write-Host "[3] 查看日志" -ForegroundColor Cyan
+    Write-Host "[4] 完全卸载" -ForegroundColor Red
+    Write-Host "[5] 重启引擎" -ForegroundColor Gray
+    Write-Host "[0] 退出" -ForegroundColor Gray
 }
 
-# === 进程辅助函数 ===
-function Get-CoreEngineProcess {
-    Get-WmiObject Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like "*$CoreScriptPath*" }
-}
-
-function Stop-CoreEngine {
-    $procs = Get-CoreEngineProcess
-    foreach ($p in $procs) {
-        try { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue } catch {}
-    }
-    if ($procs) { Start-Sleep -Milliseconds 500 }
-}
-
-# === 虚拟网卡: Win7 使用 WMI + netsh, 与 Win10 版本功能一致 ===
-
-function Install-ForwardSMBAdapter {
-    # 辅助: 用 netsh 重命名网卡
-    function Set-AdapterName {
-        param($OldName, $NewName)
-        if (-not $OldName -or $OldName -eq $NewName) { return $true }
-        $result = netsh interface set interface name="$OldName" newname="$NewName" 2>&1
-        return ($LASTEXITCODE -eq 0)
-    }
-
-    # 检查已存在的 forwardSMB
-    $existing = Get-WmiAdapter -Name $AdapterName
-    if ($existing) {
-        if ($existing.NetConnectionStatus -ne 2) {
-            Write-Host "[信息] 虚拟网卡 $AdapterName 未启用, 正在启用..." -ForegroundColor DarkCyan
-            $result = $existing.Enable()
-            Start-Sleep -Seconds 1
-            $existing = Get-WmiAdapter -Name $AdapterName
-            if ($existing -and $existing.NetConnectionStatus -eq 2) {
-                Write-Host "[OK] 已启用" -ForegroundColor Green
-            } else {
-                Write-Host "[警告] 启用可能未生效, 请检查设备管理器" -ForegroundColor Yellow
-            }
-        }
-        return $existing.Index
-    }
-
-    # --- 多方法搜索未命名的 Loopback 网卡 ---
-    $foundName = $null
-    $foundIndex = $null
-
-    # 方法A: WMI 按描述搜索 (语言无关: Loopback / 环回 / KM-TEST)
-    $match = Get-WmiObject Win32_NetworkAdapter -ErrorAction SilentlyContinue | Where-Object {
-        ($_.Description -like "*Loopback*" -or $_.Description -like "*环回*" -or $_.Description -like "*KM-TEST*") -and
-        $_.NetConnectionID -notlike "Loopback Pseudo-Interface*" -and
-        $_.NetConnectionID -ne $AdapterName -and
-        $_.NetConnectionID
-    } | Select-Object -First 1
-    if ($match) { $foundName = $match.NetConnectionID; $foundIndex = $match.Index }
-
-    if ($foundName) {
-        Write-Host "[信息] 检测到 Loopback 网卡: $foundName" -ForegroundColor DarkCyan
-        if (Set-AdapterName -OldName $foundName -NewName $AdapterName) {
-            Write-Host "[OK] 已重命名为 $AdapterName" -ForegroundColor Green
-            $na = Get-WmiAdapter -Name $AdapterName
-            if ($na) {
-                if ($na.NetConnectionStatus -ne 2) {
-                    Write-Host "[信息] 虚拟网卡 $AdapterName 未启用, 正在启用..." -ForegroundColor DarkCyan
-                    $na.Enable() | Out-Null
-                    Start-Sleep -Seconds 1
-                }
-                return $na.Index
-            }
-            if ($foundIndex) { return $foundIndex }
-        }
-        Write-Host "[警告] 自动重命名失败, 请手动在设备管理器中重命名为 '$AdapterName' 后重新运行" -ForegroundColor Yellow
-        pause; exit 1
-    }
-
-    # 首次安装: 引导用户手动操作 (仅需一次)
-    Write-Host "`n============================================================" -ForegroundColor Yellow
-    Write-Host "  首次使用需要手动安装 Microsoft Loopback Adapter (仅此一次):" -ForegroundColor Yellow
-    Write-Host "  1. 在弹出的窗口中点 [下一步]" -ForegroundColor White
-    Write-Host "  2. 选择 [安装我手动从列表选择的硬件] → [下一步]" -ForegroundColor White
-    Write-Host "  3. 选 [网络适配器] → [下一步]" -ForegroundColor White
-    Write-Host "  4. 厂商选 [Microsoft], 型号选 [Microsoft Loopback Adapter]" -ForegroundColor White
-    Write-Host "     (Win7 的型号名称不含 KM-TEST, 如同时有 KM-TEST 也选它)" -ForegroundColor Gray
-    Write-Host "  5. [下一步] → [下一步] → 完成" -ForegroundColor White
-    Write-Host "  6. 回到本窗口按任意键, 脚本将自动接管该网卡" -ForegroundColor White
+# === 入口 ===
+# 1. 检查 SMB
+if (-not (Test-SmbDisabled)) {
     Write-Host "============================================================" -ForegroundColor Yellow
-
-    # 保存安装前的多数据源快照
-    $snapWMI = @(Get-WmiObject Win32_NetworkAdapter -ErrorAction SilentlyContinue | ForEach-Object { $_.GUID })
-    $snapNetsh = netsh interface show interface 2>$null | Out-String
-
-    Start-Process hdwwiz.exe
-    pause
-
-    # 轮询寻找新创建的 Loopback 网卡
-    for ($i = 0; $i -lt 15; $i++) {
-        Start-Sleep -Seconds 1
-
-        $allWMI = @(Get-WmiObject Win32_NetworkAdapter -ErrorAction SilentlyContinue)
-        $newWMI = $allWMI | Where-Object { ($snapWMI -notcontains $_.GUID) -and ($_.NetConnectionID -ne $AdapterName) -and $_.NetConnectionID } | Select-Object -First 1
-        if ($newWMI) {
-            Write-Host "[信息] 发现新网卡: $($newWMI.NetConnectionID) ($($newWMI.Description))" -ForegroundColor DarkCyan
-            if (Set-AdapterName -OldName $newWMI.NetConnectionID -NewName $AdapterName) {
-                Write-Host "[OK] 虚拟网卡 $AdapterName 创建成功" -ForegroundColor Green
-                $na = Get-WmiAdapter -Name $AdapterName
-                if ($na) { return $na.Index }
-                return $newWMI.Index
-            }
-        }
-
-        if (Get-WmiAdapter -Name $AdapterName) { break }
-    }
-
-    # 已成功注册的检查
-    $na = Get-WmiAdapter -Name $AdapterName
-    if ($na) {
-        Write-Host "[OK] 虚拟网卡 $AdapterName 已就绪" -ForegroundColor Green
-        return $na.Index
-    }
-
-    # 兜底: netsh 文本对比 + PnP 设备查询
-    $nowNetsh = netsh interface show interface 2>$null | Out-String
-    if ($nowNetsh -ne $snapNetsh) {
-        Write-Host "[信息] netsh 检测到接口变更, 但自动接管失败" -ForegroundColor Yellow
-        Write-Host "  请手动在设备管理器中将新出现的网卡重命名为 '$AdapterName'" -ForegroundColor White
-        Write-Host "  然后重新运行本脚本" -ForegroundColor White
-        pause; exit 1
-    }
-
-    $pnp = Get-WmiObject Win32_PnPEntity -ErrorAction SilentlyContinue | Where-Object {
-        ($_.Name -like "*Loopback*" -or $_.Name -like "*环回*" -or
-         $_.Name -like "*KM-TEST*" -or $_.Name -like "*MSLOOP*")
-    } | Select-Object -First 1
-    if ($pnp) {
-        Write-Host "[信息] PnP 检测到设备: $($pnp.Name)" -ForegroundColor Yellow
-        Write-Host "  但无法通过脚本自动配置, 请手动在设备管理器中重命名为 '$AdapterName'" -ForegroundColor White
-        Write-Host "  然后重新运行本脚本" -ForegroundColor White
-        pause; exit 1
-    }
-
-    Write-Host "[错误] 未检测到新创建的 Loopback 网卡, 请确认安装是否成功" -ForegroundColor Red
-    pause; exit 1
+    Write-Host " [首次运行] 安装须知" -ForegroundColor Yellow
+    Write-Host "============================================================" -ForegroundColor Yellow
+    Write-Host " 本工具需禁用系统原生 445 端口服务，将产生以下影响:" -ForegroundColor White
+    Write-Host "  - 本机 Windows 文件共享 (SMB/CIFS) 将不可用" -ForegroundColor Gray
+    Write-Host "  - 其他设备无法通过 \\\\IP 或 \\\\主机名 访问本机共享" -ForegroundColor Gray
+    Write-Host "  - 快速启动将被关闭 (确保重启后 445 释放)" -ForegroundColor Gray
+    Write-Host "  - 以上所有修改可通过 [4] 完全卸载 恢复原状" -ForegroundColor Green
+    Write-Host "============================================================" -ForegroundColor Yellow
+    $choice = Read-Host "是否继续? [y/N]"
+    if ($choice -ne 'y' -and $choice -ne 'Y') { exit 0 }
+    Disable-SmbAndFastBoot
 }
 
-function Remove-ForwardSMBAdapter {
-    $adapter = Get-WmiAdapter -Name $AdapterName
-    if (-not $adapter) {
-        Write-Host "[信息] 未找到虚拟网卡 $AdapterName" -ForegroundColor Gray
-        return
-    }
-
-    Write-Host "正在移除虚拟网卡 $AdapterName ..." -ForegroundColor Yellow
-
-    # 移除该网卡上的 IP
-    Write-Host "  移除虚拟IP..." -ForegroundColor DarkCyan
-    netsh interface ip delete address name="$AdapterName" addr=$VirtualIP 2>$null | Out-Null
-
-    # 禁用网卡
-    Write-Host "  禁用网卡..." -ForegroundColor DarkCyan
-    try {
-        $result = $adapter.Disable()
-        if ($result.ReturnValue -eq 0) {
-            Write-Host "[OK] 虚拟网卡 $AdapterName 已禁用" -ForegroundColor Green
-        } else {
-            Write-Host "[警告] 禁用返回码: $($result.ReturnValue)" -ForegroundColor Yellow
-        }
-    } catch {
-        Write-Host "[警告] 禁用异常: $($_.Exception.Message)" -ForegroundColor Yellow
-    }
-
-    # Win7 WMI 不支持直接卸载硬件, 引导用户手动操作
-    Write-Host "  如需彻底删除, 请在设备管理器中右键 '$AdapterName' 选择卸载" -ForegroundColor Gray
-}
-
-# === 本机防火墙: Win7 全部使用 netsh advfirewall ===
-
-function Add-LocalFirewallRule {
-    Write-Host "正在配置本机防火墙放行规则 (仅限 ${VirtualIP}:${LocalPort})..." -ForegroundColor DarkCyan
-
-    # 先尝试删除再添加 (netsh 无原生 exist 判定, 避免语言依赖)
-    netsh advfirewall firewall delete rule name="$FirewallRuleName" 2>$null | Out-Null
-    $result = netsh advfirewall firewall add rule name="$FirewallRuleName" dir=in action=allow protocol=TCP localport=$LocalPort localip=$VirtualIP 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        Write-Host "[OK] 防火墙规则添加成功" -ForegroundColor Green
+# 2. 检查 445 端口
+$portCheck = cmd /c "netstat -ano" 2>$null | Select-String "LISTENING" | Select-String ":$($LocalPort)\s"
+if ($portCheck) {
+    $engProcs = Get-EngineProcess
+    $isOwn = $false
+    foreach ($ep in $engProcs) { if ($portCheck -match $ep.ProcessId) { $isOwn = $true; break } }
+    if ($isOwn) {
+        Write-Host "[信息] 检测到残留引擎, 正在清理..." -ForegroundColor Yellow
+        Stop-Engine
     } else {
-        Write-Host "[警告] 防火墙规则添加失败: $result" -ForegroundColor Yellow
-    }
-}
-
-function Remove-LocalFirewallRule {
-    netsh advfirewall firewall delete rule name="$FirewallRuleName" 2>$null | Out-Null
-}
-
-# === 设置虚拟IP并释放445端口 ===
-function Check-And-Fix-Environment {
-    Write-Host "`n[环境检查] 清理残留的核心引擎进程..." -ForegroundColor Cyan
-    Stop-CoreEngine
-
-    Write-Host "`n[环境检查] 检查本机445端口环境..." -ForegroundColor Cyan
-
-    $srvnet = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\srvnet" -Name "Start" -ErrorAction SilentlyContinue
-    $lanman = Get-Service -Name LanmanServer -ErrorAction SilentlyContinue
-
-    $srvnetDisabled = ($srvnet -and $srvnet.Start -eq 4)
-    $lanmanNotAuto = ($lanman -and $lanman.StartType -ne "Automatic")
-
-    if (-not $srvnetDisabled -or ($lanman -and -not $lanmanNotAuto)) {
-        Write-Host "检测到本机SMB驱动或LanmanServer正在占用445端口" -ForegroundColor Yellow
-        Write-Host "正在禁用本地服务以释放445端口..." -ForegroundColor DarkCyan
-
-        Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\srvnet" -Name "Start" -Value 4
-        Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\smbdevice" -Name "Start" -Value 4 -ErrorAction SilentlyContinue
-        Set-Service -Name LanmanServer -StartupType Disabled
-        try { Stop-Service -Name LanmanServer -Force } catch {}
-
-        $hiberboot = Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" -Name "HiberbootEnabled" -ErrorAction SilentlyContinue
-        if (-not $hiberboot -or $hiberboot.HiberbootEnabled -ne 0) {
-            Write-Host "正在关闭 Windows 快速启动 (避免重启后 445 端口仍被占用)..." -ForegroundColor DarkCyan
-            Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" -Name "HiberbootEnabled" -Value 0 -ErrorAction SilentlyContinue
-            Write-Host "[OK] 快速启动已关闭, 下次重启将完整重载驱动" -ForegroundColor Green
-        } else {
-            Write-Host "[OK] 快速启动已关闭 (HiberbootEnabled = 0)" -ForegroundColor Green
-        }
-
         Write-Host "`n==========================================================" -ForegroundColor Red
-        Write-Host " [重要] 本机SMB驱动已禁用!" -ForegroundColor Yellow
-        Write-Host " 由于Windows内核限制, 必须[重启电脑]后生效" -ForegroundColor Yellow
-        Write-Host " 重启后请重新运行此脚本, 选择 [1] 继续安装" -ForegroundColor Yellow
+        Write-Host " [错误] 端口 $LocalPort 仍被占用! 是否已重启电脑?" -ForegroundColor Red
+        Write-Host $portCheck -ForegroundColor Gray
         Write-Host "==========================================================" -ForegroundColor Red
-        pause
-        exit
-    }
-
-    Write-Host "`n[环境检查] 部署虚拟网卡 ($AdapterName) 并绑定 IP ($VirtualIP)..." -ForegroundColor Cyan
-    $ifIndex = Install-ForwardSMBAdapter
-
-    # 检查 IP 是否已绑定 (用 netsh 文本匹配, 语言无关)
-    $ipCheck = netsh interface ip show addresses "$AdapterName" 2>$null | Out-String
-    $hasIP = ($ipCheck -match [regex]::Escape($VirtualIP))
-    if (-not $hasIP) {
-        # 清理可能残留在其他网卡上的旧 IP
-        netsh interface ip delete address "$AdapterName" addr=$VirtualIP 2>$null | Out-Null
-
-        Write-Host "正在将 $VirtualIP 绑定到网卡: $AdapterName" -ForegroundColor DarkCyan
-        $addResult = netsh interface ip add address name="$AdapterName" addr=$VirtualIP mask=255.255.255.255 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host "[错误] 绑定IP失败: $addResult" -ForegroundColor Red
-            # 尝试其他方式
-            $addResult2 = netsh interface ipv4 add address name="$AdapterName" addr=$VirtualIP mask=255.255.255.255 2>&1
-            if ($LASTEXITCODE -ne 0) {
-                Write-Host "[错误] IPv4 绑定也失败: $addResult2" -ForegroundColor Red
-            }
-        }
-        Write-Host "[OK] 虚拟IP $VirtualIP 已绑定" -ForegroundColor Green
-    } else {
-        Write-Host "[OK] 虚拟IP $VirtualIP 已激活" -ForegroundColor Green
-    }
-
-    $inUse = netstat -ano | Select-String "LISTENING" | Select-String ":${LocalPort}\s"
-    if ($inUse) {
-        Write-Host "[错误] 445端口仍被占用! 是否已重启电脑?" -ForegroundColor Red
-        Write-Host $inUse
         pause; exit 1
     }
-
-    Write-Host "`n[环境检查] 配置本机防火墙..." -ForegroundColor Cyan
-    Add-LocalFirewallRule
-
-    Write-Host "[OK] 环境就绪, 可以建立代理桥接" -ForegroundColor Green
 }
 
-# === 生成后台核心引擎脚本 (与 Win10/11 版完全一致) ===
-function Write-CoreEngineScript {
-    $header = @"
-`$ConfigPath = '$ConfigPath'
-`$LogPath = '$LogPath'
-`$LocalPort = $LocalPort
-`$VirtualIP = '$VirtualIP'
-"@
-
-    $body = @'
-$ErrorActionPreference = "SilentlyContinue"
-
-function Write-Log {
-    param([string]$Message)
-    $line = "[{0}] {1}" -f (Get-Date -Format "yyyy-MM-dd HH:mm:ss"), $Message
-    try {
-        Add-Content -Path $LogPath -Value $line -Encoding UTF8
-        $logFile = Get-Item $LogPath -ErrorAction SilentlyContinue
-        if ($logFile -and $logFile.Length -gt 5MB) {
-            Set-Content -Path $LogPath -Value $line -Encoding UTF8
-        }
-    } catch {}
+# 3. 确保已有线路的网卡 IP 绑定就绪
+$l = @(Read-Config)
+$hasAdapter = $false
+foreach ($x in $l) {
+    $na = Get-AdapterById $x.Id
+    if ($na) { Add-AdapterIP $x.Id $x.IP; Add-Firewall $x.Id $x.IP; $hasAdapter = $true }
+    else { Write-Host "[警告] 线路 $($x.Id) 的网卡不存在, 请删除后重新添加" -ForegroundColor Yellow }
 }
+if ($hasAdapter) { Start-Engine }
+if (-not (Test-Path $ToolboxDir)) { New-Item -ItemType Directory $ToolboxDir -Force | Out-Null }
 
-function Resolve-RemoteEndpoint {
-    param([string]$Domain)
-    $results = @()
-    try {
-        $addrs = [System.Net.Dns]::GetHostAddresses($Domain)
-        $v6 = $addrs | Where-Object { $_.AddressFamily -eq "InterNetworkV6" } | Select-Object -First 1
-        if ($v6) { $results += @{ IP = $v6.IPAddressToString; Family = "InterNetworkV6" } }
-        $v4 = $addrs | Where-Object { $_.AddressFamily -eq "InterNetwork" } | Select-Object -First 1
-        if ($v4) { $results += @{ IP = $v4.IPAddressToString; Family = "InterNetwork" } }
-    } catch {
-        Write-Log ("[DNS] GetHostAddresses({0}) 异常: {1}" -f $Domain, $_.Exception.Message)
-        # Win7 无 Resolve-DnsName, 仅依赖 GetHostAddresses 重试
-    }
-    return $results
-}
-
-function Start-Pump {
-    param($srcClient, $dstClient)
-    try {
-        $srcStream = $srcClient.GetStream()
-        $dstStream = $dstClient.GetStream()
-        $task = $srcStream.CopyToAsync($dstStream, 65536)
-        $continuation = {
-            param($t)
-            try { $srcClient.Close() } catch {}
-            try { $dstClient.Close() } catch {}
-        }.GetNewClosure()
-        $task.ContinueWith([Action[System.Threading.Tasks.Task]]$continuation) | Out-Null
-    } catch {
-        try { $srcClient.Close() } catch {}
-        try { $dstClient.Close() } catch {}
-    }
-}
-
-Write-Log "===== 核心引擎启动 ====="
-
-$conf = $null
-for ($i = 0; $i -lt 10; $i++) {
-    if (Test-Path $ConfigPath) {
-        try { $conf = Get-Content $ConfigPath -Raw | ConvertFrom-Json; break } catch {}
-    }
-    Start-Sleep -Seconds 2
-}
-if (-not $conf) { Write-Log "配置文件读取失败, 引擎退出"; exit 1 }
-
-$Domain = $conf.Domain
-$RPort = [int]$conf.Port
-
-$endpoints = @()
-for ($i = 0; $i -lt 30; $i++) {
-    $endpoints = @(Resolve-RemoteEndpoint -Domain $Domain)
-    if ($endpoints.Count -gt 0) { break }
-    Write-Log ("[DNS] 解析({0})尚未成功, 5秒后重试 ({1}/30)" -f $Domain, ($i + 1))
-    Start-Sleep -Seconds 5
-}
-if ($endpoints.Count -eq 0) { Write-Log ("多次DNS解析({0})均失败(开机时网络可能还未就绪), 引擎退出, 等待下次计划任务重启" -f $Domain); exit 1 }
-$endpointLog = ($endpoints | ForEach-Object { "{0}({1})" -f $_.IP, ($_.Family -replace "InterNetworkV6","V6" -replace "InterNetwork","V4") }) -join ", "
-Write-Log ("DNS解析成功: {0} -> [{1}]" -f $Domain, $endpointLog)
-
-$server = $null
-for ($i = 0; $i -lt 10; $i++) {
-    try {
-        $server = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Parse($VirtualIP), $LocalPort)
-        $server.Start()
-        break
-    } catch {
-        Write-Log ("监听 {0}:{1} 失败: {2}, 5秒后重试" -f $VirtualIP, $LocalPort, $_.Exception.Message)
-        $server = $null
-        Start-Sleep -Seconds 5
-    }
-}
-if (-not $server) { Write-Log "多次尝试仍无法监听端口, 引擎退出"; exit 1 }
-Write-Log ("已开始监听 {0}:{1}" -f $VirtualIP, $LocalPort)
-
-$lastResolve = Get-Date
-$resolveIntervalSec = 10
-$activeIndex = 0
-
-while ($true) {
-    try {
-        if (((Get-Date) - $lastResolve).TotalSeconds -ge $resolveIntervalSec) {
-            $newEndpoints = @(Resolve-RemoteEndpoint -Domain $Domain)
-            if ($newEndpoints.Count -gt 0) {
-                $oldIPs = ($endpoints | ForEach-Object { $_.IP }) -join ","
-                $newIPs = ($newEndpoints | ForEach-Object { $_.IP }) -join ","
-                if ($oldIPs -ne $newIPs) {
-                    Write-Log ("检测到DDNS地址变更: [{0}] -> [{1}]" -f $oldIPs, $newIPs)
-                    $endpoints = $newEndpoints
-                    $activeIndex = 0
-                }
-            }
-            $lastResolve = Get-Date
-        }
-
-        if (-not $server.Pending()) {
-            Start-Sleep -Milliseconds 200
-            continue
-        }
-
-        $client = $server.AcceptTcpClient()
-        $remote = $null
-        $startIdx = $activeIndex
-        for ($try = 0; $try -lt $endpoints.Count; $try++) {
-            $idx = ($startIdx + $try) % $endpoints.Count
-            $ep = $endpoints[$idx]
-            try {
-                $ipAddr = [System.Net.IPAddress]::Parse($ep.IP)
-                $remote = New-Object System.Net.Sockets.TcpClient($ipAddr.AddressFamily)
-                $remote.Connect($ipAddr, $RPort)
-                $activeIndex = $idx
-                break
-            } catch {
-                Write-Log ("连接 {0}({1}):{2} 失败: {3}" -f $ep.IP, ($ep.Family -replace "InterNetworkV6","V6" -replace "InterNetwork","V4"), $RPort, $_.Exception.Message)
-                if ($remote) { try { $remote.Close() } catch {} }
-                $remote = $null
-            }
-        }
-        if (-not $remote) {
-            Write-Log ("所有地址均无法连接, 丢弃此客户端连接")
-            $client.Close()
-            continue
-        }
-
-        Write-Log ("新连接已建立 -> {0}:{1} ({2})" -f $endpoints[$activeIndex].IP, $RPort, ($endpoints[$activeIndex].Family -replace "InterNetworkV6","V6" -replace "InterNetwork","V4"))
-        Start-Pump -srcClient $client -dstClient $remote
-        Start-Pump -srcClient $remote -dstClient $client
-    } catch {
-        Write-Log ("主循环异常: {0}" -f $_.Exception.Message)
-        Start-Sleep -Seconds 2
-    }
-}
-'@
-
-    $fullCode = $header + "`r`n" + $body
-    Set-Content -Path $CoreScriptPath -Value $fullCode -Encoding UTF8
-}
-
-# === 菜单1: 引导安装 ===
-function Install-Client-Proxy {
-    Check-And-Fix-Environment
-
-    Write-Host "`n[配置] 远程服务器信息..." -ForegroundColor Cyan
-
-    $defaultDomain = ""
-    $defaultPort = "1445"
-    if (Test-Path $ConfigPath) {
-        try {
-            $conf = Get-Content $ConfigPath | ConvertFrom-Json
-            $defaultDomain = $conf.Domain
-            $defaultPort = $conf.Port
-        } catch {}
-    }
-
-    if ($defaultDomain) {
-        $inputDomain = Read-Host "输入远程DDNS域名 (直接回车使用: $defaultDomain)"
-    } else {
-        $inputDomain = Read-Host "输入远程DDNS域名 (例如: mynas.dns.com)"
-    }
-    if (-not $inputDomain) { $inputDomain = $defaultDomain }
-    if (-not $inputDomain) { Write-Host "域名不能为空!" -ForegroundColor Red; pause; return }
-
-    Write-Host "`n[DNS预检] 正在解析域名: $inputDomain ..." -ForegroundColor Cyan
-    $dnsOK = $false
-    try {
-        $addrs = [System.Net.Dns]::GetHostAddresses($inputDomain)
-        $v6 = $addrs | Where-Object { $_.AddressFamily -eq "InterNetworkV6" } | Select-Object -First 1
-        $v4 = $addrs | Where-Object { $_.AddressFamily -eq "InterNetwork" } | Select-Object -First 1
-        if ($v6) { Write-Host "[DNS预检] 解析成功 (IPv6): $($v6.IPAddressToString)" -ForegroundColor Green; $dnsOK = $true }
-        if ($v4) { Write-Host "[DNS预检] 解析成功 (IPv4): $($v4.IPAddressToString)" -ForegroundColor Green; $dnsOK = $true }
-    } catch {}
-    if (-not $dnsOK) {
-        Write-Host "[DNS预检] 警告: 无法解析域名 '$inputDomain', 请确认域名正确且DDNS已生效" -ForegroundColor Yellow
-        Write-Host "  引擎将在后台持续重试DNS解析, 若DDNS稍后生效可自动恢复" -ForegroundColor Gray
-        Write-Host "  若域名本身错误, 请重新运行安装并输入正确域名" -ForegroundColor Gray
-    }
-
-    $inputPort = Read-Host "`n输入远程端口号 (直接回车使用: $defaultPort)"
-    if (-not $inputPort) { $inputPort = $defaultPort }
-    $portNum = 0
-    if (-not ([int]::TryParse($inputPort, [ref]$portNum) -and $portNum -ge 1 -and $portNum -le 65535)) {
-        Write-Host "端口号无效 (必须是 1-65535 之间的整数), 已取消" -ForegroundColor Red; pause; return
-    }
-
-    if (-not (Test-Path $PSToolboxPath)) { New-Item -ItemType Directory -Path $PSToolboxPath | Out-Null }
-    @{ Domain = $inputDomain; Port = $portNum } | ConvertTo-Json | Set-Content $ConfigPath
-
-    Write-Host "`n[部署] 正在写入后台核心引擎..." -ForegroundColor Cyan
-    Write-CoreEngineScript
-
-    # === 计划任务: Win7 使用 schtasks (不支持崩溃自动重启) ===
-    Write-Host "`n[任务] 创建系统自启任务..." -ForegroundColor Cyan
-    Write-Host "[信息] Win7 计划任务不支持崩溃自动重启, 依赖引擎内部自愈" -ForegroundColor Gray
-
-    $taskAction = "powershell.exe -WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$CoreScriptPath`""
-    $schtasksResult = cmd /c "schtasks /create /tn `"$TaskName`" /tr `"$taskAction`" /sc onstart /ru SYSTEM /rl HIGHEST /delay 00:20 /f 2>&1"
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "[错误] 创建计划任务失败: $schtasksResult" -ForegroundColor Red
-        Write-Host "  请尝试以管理员身份手动创建" -ForegroundColor Yellow
-    } else {
-        Write-Host "[OK] 计划任务已创建 (开机延迟 20s 自启)" -ForegroundColor Green
-    }
-
-    Stop-CoreEngine
-    Start-Process -FilePath "powershell.exe" -ArgumentList "-WindowStyle Hidden -NoProfile -ExecutionPolicy Bypass -File `"$CoreScriptPath`"" -WindowStyle Hidden
-
-    $check = $null
-    for ($i = 0; $i -lt 15; $i++) {
-        Start-Sleep -Seconds 1
-        $check = netstat -ano | Select-String "${VirtualIP}:${LocalPort}"
-        if ($check) { break }
-    }
-
-    Write-Host "`n=====================================================" -ForegroundColor Green
-    Write-Host "  客户端代理配置完成!" -ForegroundColor Green
-    Write-Host "  远程目标: [$inputDomain]:$inputPort" -ForegroundColor White
-
-    if ($check) {
-        Write-Host "  [状态] 引擎已启动, 端口监听正常" -ForegroundColor Green
-    } else {
-        Write-Host "  [警告] 端口未检测到监听, 请用菜单 [3] 查看日志排查原因: $LogPath" -ForegroundColor Yellow
-    }
-
-    Write-Host "  使用方法 (绕过回环限制):" -ForegroundColor Green
-    Write-Host "     Win+R 打开运行, 输入: \\$VirtualIP" -ForegroundColor Yellow
-    Write-Host "     或在文件管理器地址栏输入: \\$VirtualIP\共享名" -ForegroundColor Yellow
-    Write-Host "=====================================================" -ForegroundColor Green
-    pause
-}
-
-# === 菜单2: 停止并清理 ===
-function Remove-And-Restore {
-    Write-Host "`n正在停止代理进程并移除计划任务..." -ForegroundColor Yellow
-
-    $taskExists = cmd /c "schtasks /query /tn `"$TaskName`" /fo csv /nh 2>nul" 2>$null
-    if ($LASTEXITCODE -eq 0) {
-        cmd /c "schtasks /delete /tn `"$TaskName`" /f 2>nul" 2>$null | Out-Null
-        Write-Host "[OK] 计划任务已移除" -ForegroundColor Green
-    }
-
-    Stop-CoreEngine
-    Write-Host "[OK] 代理进程已终止" -ForegroundColor Green
-
-    Write-Host "正在移除虚拟IP ($VirtualIP)..." -ForegroundColor Yellow
-    netsh interface ip delete address name="$AdapterName" addr=$VirtualIP 2>$null | Out-Null
-
-    Write-Host "正在移除虚拟网卡 ($AdapterName)..." -ForegroundColor Yellow
-    Remove-ForwardSMBAdapter
-
-    Write-Host "正在移除防火墙规则..." -ForegroundColor Yellow
-    Remove-LocalFirewallRule
-
-    Write-Host "正在恢复Windows默认SMB服务..." -ForegroundColor Yellow
-    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\srvnet" -Name "Start" -Value 3
-    Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Services\smbdevice" -Name "Start" -Value 3 -ErrorAction SilentlyContinue
-    Set-Service -Name LanmanServer -StartupType Automatic
-    try { Start-Service -Name LanmanServer } catch {}
-
-    if (Test-Path $PSToolboxPath) { Remove-Item -Path $PSToolboxPath -Recurse -Force }
-
-    Write-Host "`n==========================================================" -ForegroundColor Green
-    Write-Host "  已成功恢复Windows默认SMB设置!" -ForegroundColor Green
-    Write-Host "  [提示] 建议[重启电脑]以使所有更改完全生效" -ForegroundColor Yellow
-    Write-Host "==========================================================" -ForegroundColor Green
-    pause
-}
-
-# === 菜单3: 查看日志 ===
-function Show-EngineLog {
-    Write-Host "`n=== 最近日志: $LogPath ===" -ForegroundColor Cyan
-    if (Test-Path $LogPath) {
-        Get-Content -Path $LogPath -Tail 50
-    } else {
-        Write-Host "(暂无日志, 引擎可能从未成功运行过, 请先执行 [1] 安装)" -ForegroundColor Gray
-    }
-    Write-Host ""
-    pause
-}
-
-# === 主循环 ===
 do {
     Show-Menu
-    $choice = Read-Host "`n请选择操作 (1-4)"
-    switch ($choice) {
-        "1" { Install-Client-Proxy }
-        "2" { Remove-And-Restore }
-        "3" { Show-EngineLog }
-        "4" { exit }
+    $c = Read-Host "`n请选择 (0-5)"
+    switch ($c) {
+        "1" { Add-Line }
+        "2" { Remove-Line }
+        "3" { Write-Host "`n--- 日志 ---" -ForegroundColor Cyan; if (Test-Path $LogPath) { Get-Content $LogPath -Tail 50 } else { Write-Host "(无日志)" -ForegroundColor Gray }; pause }
+        "4" { Full-Uninstall }
+        "5" { Write-Host "`n重启引擎..." -ForegroundColor Cyan; Start-Engine; Write-Host "[OK]" -ForegroundColor Green; pause }
+        "0" { exit }
     }
 } while ($true)

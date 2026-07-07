@@ -10,6 +10,7 @@
 #Requires -RunAsAdministrator
 
 function Show-Menu {
+    Clear-Host
     Write-Host @"
 
 ============================================
@@ -145,7 +146,8 @@ function Add-Rule {
     Write-Host "  Windows  : 运行 setup-client.ps1 (选择对应的IP类型)" -ForegroundColor White
     Write-Host "  Linux    : mount -t cifs //域名:$port/共享名 /mnt -o user=用户名" -ForegroundColor White
     Write-Host "  macOS    : mount_smbfs //用户名@域名:$port/共享名 /Volumes/挂载点" -ForegroundColor White
-    Write-Host "  Android  : Solid Explorer (支持自定义端口)" -ForegroundColor White
+    Write-Host "  Android  : Solid Explorer / Material Files (支持自定义端口)" -ForegroundColor White
+    Write-Host "  iOS      : FileBrowser Pro / FE File Explorer (支持自定义端口)" -ForegroundColor White
 }
 
 function Remove-Rule {
