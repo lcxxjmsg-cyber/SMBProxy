@@ -1,2 +1,0 @@
-powershell -ExecutionPolicy Bypass -File .\setup-server.ps1        # 服务端
-powershell -ExecutionPolicy Bypass -File .\setup-client-win10-11.ps1  # 客户端
