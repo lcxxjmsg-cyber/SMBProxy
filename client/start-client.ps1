@@ -76,17 +76,43 @@ $T = @{
 }
 function M([string]$key) { [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($T[$key])) }
 
-# ---- wipe this command from PowerShell history (user asked not to record it) ----
-# Deletes the persistent PSReadLine history file, clears the in-memory session
-# history, and switches the current session to SaveNothing so the running
-# "irm | iex" line is not flushed back to disk when it finishes.
+# ---- precisely scrub only THIS tool's traces from history (keep everything else) ----
+# Signature: any command line mentioning our script name or project.
+$HistSig = 'start-client|SMBProxy'
 function Clear-CommandHistory {
-    try { Clear-History -ErrorAction SilentlyContinue } catch {}
+    # (1) Win+R "Run" box history (registry RunMRU): remove matching entries and
+    #     fix the MRUList ordering string, preserving all other entries.
+    try {
+        $rk = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\RunMRU"
+        if (Test-Path $rk) {
+            $props = Get-ItemProperty $rk
+            $skip = @('MRUList','PSPath','PSParentPath','PSChildName','PSDrive','PSProvider')
+            $remove = @()
+            foreach ($p in $props.PSObject.Properties) {
+                if ($skip -contains $p.Name) { continue }
+                if ([string]$p.Value -match $HistSig) { $remove += $p.Name }
+            }
+            foreach ($name in $remove) { Remove-ItemProperty -Path $rk -Name $name -ErrorAction SilentlyContinue }
+            if ($props.MRUList) {
+                $newMru = ($props.MRUList.ToCharArray() | Where-Object { $remove -notcontains [string]$_ }) -join ''
+                Set-ItemProperty -Path $rk -Name 'MRUList' -Value $newMru -ErrorAction SilentlyContinue
+            }
+        }
+    } catch {}
+
+    # (2) PSReadLine up-arrow history file: rewrite it without matching lines,
+    #     preserving all other commands the user has typed.
     try {
         $h = (Get-PSReadLineOption -ErrorAction SilentlyContinue).HistorySavePath
-        if ($h -and (Test-Path $h)) { Remove-Item $h -Force -ErrorAction SilentlyContinue }
+        if ($h -and (Test-Path $h)) {
+            $kept = Get-Content $h -ErrorAction SilentlyContinue | Where-Object { $_ -notmatch $HistSig }
+            Set-Content -Path $h -Value $kept -Encoding UTF8 -ErrorAction SilentlyContinue
+        }
     } catch {}
-    try { Set-PSReadLineOption -HistorySaveStyle SaveNothing -ErrorAction SilentlyContinue } catch {}
+
+    # (3) Current session in-memory histories (this transient window only).
+    try { Clear-History -ErrorAction SilentlyContinue } catch {}
+    try { [Microsoft.PowerShell.PSConsoleReadLine]::ClearHistory() } catch {}
 }
 Clear-CommandHistory
 
@@ -105,6 +131,7 @@ if (-not $isAdmin) {
     } catch {
         Write-Host (M 'elevateFail') -ForegroundColor Red
     }
+    Clear-CommandHistory   # scrub again right before this (non-admin) window returns
     return
 }
 
