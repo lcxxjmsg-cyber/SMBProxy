@@ -130,6 +130,33 @@
 
 ## 快速开始
 
+### 0. 一键启动客户端（新手推荐 · 无需下载）
+
+不用 git clone，也不用手动找脚本。**只要一行命令**，它会自动拉取并运行客户端引导，帮你识别系统、选对脚本。
+
+**方式 A：Win + R 运行框**
+
+1. 按键盘 `Win + R`，弹出"运行"小窗口
+2. 粘贴下面这行，回车：
+
+```
+powershell "irm https://cdn.jsdelivr.net/gh/lcxxjmsg-cyber/SMBProxy@main/client/start-client.ps1 | iex"
+```
+
+**方式 B：命令提示符 (CMD)**
+
+打开 CMD，粘贴同一行命令，回车即可：
+
+```
+powershell "irm https://cdn.jsdelivr.net/gh/lcxxjmsg-cyber/SMBProxy@main/client/start-client.ps1 | iex"
+```
+
+> 💡 弹出**用户账户控制 (UAC)** 提示时，点"是"以管理员权限运行即可，剩下的全自动完成。
+
+---
+
+### 手动方式（下载仓库后本地运行，保留原有流程）
+
 **管理员 PowerShell** 执行：
 
 ```powershell
