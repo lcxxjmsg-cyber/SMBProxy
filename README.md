@@ -140,7 +140,7 @@
 2. 粘贴下面这行，回车：
 
 ```
-powershell "irm https://cdn.jsdelivr.net/gh/lcxxjmsg-cyber/SMBProxy@main/client/start-client.ps1 | iex"
+powershell "irm https://gh-proxy.com/https://raw.githubusercontent.com/lcxxjmsg-cyber/SMBProxy/main/client/start-client.ps1 | iex"
 ```
 
 **方式 B：命令提示符 (CMD)**
@@ -148,7 +148,7 @@ powershell "irm https://cdn.jsdelivr.net/gh/lcxxjmsg-cyber/SMBProxy@main/client/
 打开 CMD，粘贴同一行命令，回车即可：
 
 ```
-powershell "irm https://cdn.jsdelivr.net/gh/lcxxjmsg-cyber/SMBProxy@main/client/start-client.ps1 | iex"
+powershell "irm https://gh-proxy.com/https://raw.githubusercontent.com/lcxxjmsg-cyber/SMBProxy/main/client/start-client.ps1 | iex"
 ```
 
 > 💡 弹出**用户账户控制 (UAC)** 提示时，点"是"以管理员权限运行即可，剩下的全自动完成。
