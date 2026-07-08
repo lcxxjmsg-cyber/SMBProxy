@@ -155,6 +155,18 @@ powershell "irm https://gh-proxy.com/https://raw.githubusercontent.com/lcxxjmsg-
 
 ---
 
+### 0'. 一键启动服务端（无需下载）
+
+服务端脚本也支持一行命令直接运行（借助 [GitHub Script Entrance](https://github.com/lcxxjmsg-cyber/GitHub-Script-Entrance) 自动提权、镜像加速）：
+
+**Win + R 运行框** 或 **CMD**，粘贴下面这行，回车（UAC 点"是"）：
+
+```
+powershell "& ([scriptblock]::Create((irm 'https://gh-proxy.com/https://raw.githubusercontent.com/lcxxjmsg-cyber/GitHub-Script-Entrance/main/launch.ps1'))) -r 'https://github.com/lcxxjmsg-cyber/SMBProxy/blob/main/server/setup-server.ps1'"
+```
+
+---
+
 ### 手动方式（下载仓库后本地运行，保留原有流程）
 
 **管理员 PowerShell** 执行：
