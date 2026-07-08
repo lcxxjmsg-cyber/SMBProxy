@@ -15,9 +15,10 @@
       2. Detect Windows edition -> route to the matching setup-client script
       3. Fetch the setup script online and run it in memory (no file on disk)
       4. Cache Win7/2008R2 offline plugins to a fixed temp dir (survives reboot)
-      5. Smart resume: install needs 1-3 reboots, continued by a logon task
+      5. No auto-start: when a reboot is required, ask the user to re-run this
+         same one-liner manually (Win+R) after rebooting. No scheduled task.
       6. Stage detection via dependency / SMB state
-      7. When fully ready: remove the resume task + clear cached plugins
+      7. When fully ready: clear cached plugins
       8. Multi-mirror download with automatic fallback (GitHub proxies + CDN)
 
     Usage:
@@ -31,7 +32,6 @@ $GitHubBranch = 'main'
 # ================================
 
 $Repo      = "$GitHubUser/$GitHubRepo"
-$TaskName  = 'SMBProxy_ClientBootstrap'
 $cacheRoot = Join-Path $env:TEMP 'SMBProxy'
 # Primary entry via jsDelivr (CDN-cached, CN-reachable, not rate-limited).
 $SelfUrl   = "https://cdn.jsdelivr.net/gh/$Repo@$GitHubBranch/client/start-client.ps1"
@@ -41,16 +41,12 @@ $T = @{
     title        = 'PT09PT09PT09PT09PT0gU01CUHJveHkg5a6i5oi356uv5byV5a+8ID09PT09PT09PT09PT09'
     elevate      = 'WypdIOato+WcqOivt+axgueuoeeQhuWRmOadg+mZkC4uLg=='
     elevateFail  = 'W+mUmeivr10g5o+Q5p2D6KKr5Y+W5raI5oiW5aSx6LSl44CC'
-    taskOk       = 'WypdIOW3suazqOWGjOmHjeWQr+e7rei3keS7u+WKoe+8jOmHjeWQr+eZu+W9leWQjuiHquWKqOe7p+e7rQ=='
-    taskFail     = 'W+itpuWRil0g57ut6LeR5Lu75Yqh5rOo5YaM5aSx6LSl77yM6YeN5ZCv5ZCO6K+35omL5Yqo6YeN5paw6L+Q6KGM5ZG95Luk44CC'
-    taskRemoved  = 'WypdIOW3suenu+mZpOmHjeWQr+e7rei3keS7u+WKoQ=='
     cacheCleared = 'WypdIOW3sua4heeQhue8k+WtmOaPkuS7tg=='
     caching      = 'WypdIOato+WcqOe8k+WtmOemu+e6v+aPkuS7tu+8iOaWh+S7tui+g+Wkp++8jOW3suagoemqjOeahOWwhui3s+i/h++8iS4uLg=='
     skipVerified = 'ICAgIOW3sue8k+WtmDog'
     reDownload   = 'ICAgIOmHjeaWsOS4i+i9vSjnvJPlrZjmjZ/lnY8pOiA='
     downloading  = 'ICAgIOS4i+i9veS4rTog'
     fetching     = 'WypdIOato+WcqOiOt+WPluWuieijheiEmuacrC4uLg=='
-    launching    = 'WypdIOato+WcqOWQr+WKqOWuieijheeoi+W6jy4uLg=='
     osLabel      = 'ICDns7vnu586IA=='
     verLabel     = 'ICDniYjmnKw6IA=='
     srv          = '5pyN5Yqh5Zmo'
@@ -68,11 +64,8 @@ $T = @{
     stageA       = 'W+mYtuautSBBXSDlronoo4Xns7vnu5/kvp3otZYgKFNIQS0yIC8gLk5FVCA0LjggLyBXTUYgNS4xKQ=='
     stageB       = 'W+mYtuautSBCXSDnpoHnlKjns7vnu58gNDQ1IOacjeWKoeW5tuWFs+mXreW/q+mAn+WQr+WKqA=='
     stageC       = 'W+mYtuautSBDXSDnjq/looPlt7LlsLHnu6rvvIzov5vlhaXphY3nva7oj5zljZU='
-    rb1          = 'IFvnu63ot5Hlt7LlsLHnu6pdIOWuieijheiEmuacrOeojeWQjuS8muaPkOekuuS9oOmHjeWQr+OAgg=='
-    rb2          = 'IOivt+aMieaPkOekuumHjeWQr++8jOmHjeWQr+W5tueZu+W9leWQjuWwhuiHquWKqOe7p+e7reS4i+S4gOatpeOAgg=='
     errRun       = 'W+mUmeivr10g5omn6KGM5aSx6LSlOiA='
     errHint      = 'ICAgICAgIOiLpeS4uue9kee7nOmXrumimO+8jOmHjeaWsOi/kOihjOWRveS7pOWNs+WPr++8iOW3sue8k+WtmOWGheWuueS8muWkjeeUqO+8ieOAgg=='
-    line         = 'PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT09PT0='
 }
 function M([string]$key) { [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($T[$key])) }
 
@@ -188,22 +181,6 @@ function Download-Text([string]$rel) {
 }
 
 # ================= helpers =================
-function Register-ContinueTask {
-    # Inner double quotes must be escaped as \" for schtasks /tr, otherwise it
-    # rejects the command line ("invalid argument/option").
-    $inner = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Normal -Command "irm ''' + $SelfUrl + ''' | iex"'
-    $tr = $inner -replace '"','\"'
-    schtasks.exe /create /tn $TaskName /tr $tr /sc onlogon /rl HIGHEST /f 2>$null | Out-Null
-    if ($LASTEXITCODE -eq 0) { Write-Host (M 'taskOk') -ForegroundColor DarkGray }
-    else { Write-Host (M 'taskFail') -ForegroundColor Yellow }
-}
-function Remove-ContinueTask {
-    schtasks.exe /query /tn $TaskName 2>$null | Out-Null
-    if ($LASTEXITCODE -eq 0) {
-        schtasks.exe /delete /tn $TaskName /f 2>$null | Out-Null
-        Write-Host (M 'taskRemoved') -ForegroundColor DarkGray
-    }
-}
 function Clear-PluginCache {
     if (Test-Path $cacheRoot) {
         Remove-Item $cacheRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -245,9 +222,7 @@ function Invoke-Setup([string]$script) {
     # In-memory run: original scripts derive plugin dir from their own path,
     # which is empty when run via iex. Redirect it to our plugin cache dir.
     $text = $text.Replace('Split-Path -Parent $MyInvocation.MyCommand.Path', "'$cacheRoot'")
-    Write-Host ""
-    Write-Host (M 'launching') -ForegroundColor Cyan
-    Write-Host (M 'line') -ForegroundColor Cyan
+    Clear-Host   # wipe the bootstrap's own output so the setup menu starts clean
     Invoke-Expression $text   # the setup script may call exit; nothing after runs
 }
 
@@ -299,7 +274,6 @@ if (-not $script) {
     Write-Host (M 'unsupp1') -ForegroundColor Red
     Write-Host (M 'unsupp2') -ForegroundColor Red
     Write-Host (M 'unsupp3') -ForegroundColor Red
-    Remove-ContinueTask
     return
 }
 
@@ -337,32 +311,18 @@ Write-Host ((M 'lblDeps') + $(if($depsReady){M 'depReady'}else{M 'depNeed'})) -F
 Write-Host ((M 'lblSmb') + $(if($smbDisabled){M 'smbOff'}else{M 'smbOn'})) -ForegroundColor Green
 Write-Host ""
 
-$rebootBanner = {
-    Write-Host ""
-    Write-Host (M 'line') -ForegroundColor Yellow
-    Write-Host (M 'rb1') -ForegroundColor Yellow
-    Write-Host (M 'rb2') -ForegroundColor Yellow
-    Write-Host (M 'line') -ForegroundColor Yellow
-    Write-Host ""
-}
-
 try {
     if ($needsPlugin -and -not $depsReady) {
         Write-Host (M 'stageA') -ForegroundColor Magenta
         Ensure-Plugins $plugDir $plugFiles
-        Register-ContinueTask
-        & $rebootBanner
         Invoke-Setup $script
     }
     elseif (-not $smbDisabled) {
         Write-Host (M 'stageB') -ForegroundColor Magenta
-        Register-ContinueTask
-        & $rebootBanner
         Invoke-Setup $script
     }
     else {
         Write-Host (M 'stageC') -ForegroundColor Magenta
-        Remove-ContinueTask
         Clear-PluginCache
         Invoke-Setup $script
     }
