@@ -22,7 +22,7 @@
       8. Multi-mirror download with automatic fallback (GitHub proxies + CDN)
 
     Usage:
-      irm https://cdn.jsdelivr.net/gh/lcxxjmsg-cyber/SMBProxy@main/client/start-client.ps1 | iex
+      irm https://gh-proxy.com/https://raw.githubusercontent.com/lcxxjmsg-cyber/SMBProxy/main/client/start-client.ps1 | iex
 #>
 
 # ============ config ============
@@ -33,8 +33,9 @@ $GitHubBranch = 'main'
 
 $Repo      = "$GitHubUser/$GitHubRepo"
 $cacheRoot = Join-Path $env:TEMP 'SMBProxy'
-# Primary entry via jsDelivr (CDN-cached, CN-reachable, not rate-limited).
-$SelfUrl   = "https://cdn.jsdelivr.net/gh/$Repo@$GitHubBranch/client/start-client.ps1"
+# Elevation re-launch uses a GitHub proxy (real-time passthrough of raw, always
+# latest -> no stale CDN cache; bypasses ISP blocking of github).
+$SelfUrl   = "https://gh-proxy.com/https://raw.githubusercontent.com/$Repo/$GitHubBranch/client/start-client.ps1"
 
 # ---- localized messages: Base64(UTF-8), decoded at runtime to avoid mojibake ----
 $T = @{
@@ -88,14 +89,19 @@ if (-not $isAdmin) {
 }
 
 # ================= mirrors =================
-# Order matters: fastest / least rate-limited first.
-# jsDelivr (CDN) is preferred for scripts & small files (CN-reachable, cached,
-# not rate-limited), but has a ~50MB limit so it is skipped for big plugins.
-# GitHub proxies (gh-proxy/ghfast/ghproxy) can be flaky or rate-limited (429),
-# so they come after the CDN; raw.githubusercontent is the last resort.
+# Order matters: GitHub proxies first. They pass through raw.githubusercontent
+# in real time, so they are ALWAYS up to date (unlike jsDelivr which caches an
+# old copy for hours) and they bypass ISP blocking of github. jsDelivr is kept
+# only as a fallback for scripts/small files (it has a ~50MB limit, so it is
+# skipped for big plugins). raw.githubusercontent is the last resort (needs a
+# working direct connection / proxy).
 function Get-MirrorUrls([string]$rel, [bool]$includeCdn) {
     $b = $GitHubBranch
-    $urls = @()
+    $urls = @(
+        "https://gh-proxy.com/https://raw.githubusercontent.com/$Repo/$b/$rel",
+        "https://ghproxy.net/https://raw.githubusercontent.com/$Repo/$b/$rel",
+        "https://ghfast.top/https://raw.githubusercontent.com/$Repo/$b/$rel"
+    )
     if ($includeCdn) {
         $urls += @(
             "https://cdn.jsdelivr.net/gh/$Repo@$b/$rel",
@@ -103,12 +109,7 @@ function Get-MirrorUrls([string]$rel, [bool]$includeCdn) {
             "https://gcore.jsdelivr.net/gh/$Repo@$b/$rel"
         )
     }
-    $urls += @(
-        "https://gh-proxy.com/https://raw.githubusercontent.com/$Repo/$b/$rel",
-        "https://ghfast.top/https://raw.githubusercontent.com/$Repo/$b/$rel",
-        "https://ghproxy.net/https://raw.githubusercontent.com/$Repo/$b/$rel",
-        "https://raw.githubusercontent.com/$Repo/$b/$rel"
-    )
+    $urls += "https://raw.githubusercontent.com/$Repo/$b/$rel"
     return $urls
 }
 
