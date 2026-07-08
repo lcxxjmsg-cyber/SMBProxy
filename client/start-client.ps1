@@ -76,46 +76,6 @@ $T = @{
 }
 function M([string]$key) { [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($T[$key])) }
 
-# ---- precisely scrub only THIS tool's traces from history (keep everything else) ----
-# Signature: any command line mentioning our script name or project.
-$HistSig = 'start-client|SMBProxy'
-function Clear-CommandHistory {
-    # (1) Win+R "Run" box history (registry RunMRU): remove matching entries and
-    #     fix the MRUList ordering string, preserving all other entries.
-    try {
-        $rk = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\RunMRU"
-        if (Test-Path $rk) {
-            $props = Get-ItemProperty $rk
-            $skip = @('MRUList','PSPath','PSParentPath','PSChildName','PSDrive','PSProvider')
-            $remove = @()
-            foreach ($p in $props.PSObject.Properties) {
-                if ($skip -contains $p.Name) { continue }
-                if ([string]$p.Value -match $HistSig) { $remove += $p.Name }
-            }
-            foreach ($name in $remove) { Remove-ItemProperty -Path $rk -Name $name -ErrorAction SilentlyContinue }
-            if ($props.MRUList) {
-                $newMru = ($props.MRUList.ToCharArray() | Where-Object { $remove -notcontains [string]$_ }) -join ''
-                Set-ItemProperty -Path $rk -Name 'MRUList' -Value $newMru -ErrorAction SilentlyContinue
-            }
-        }
-    } catch {}
-
-    # (2) PSReadLine up-arrow history file: rewrite it without matching lines,
-    #     preserving all other commands the user has typed.
-    try {
-        $h = (Get-PSReadLineOption -ErrorAction SilentlyContinue).HistorySavePath
-        if ($h -and (Test-Path $h)) {
-            $kept = Get-Content $h -ErrorAction SilentlyContinue | Where-Object { $_ -notmatch $HistSig }
-            Set-Content -Path $h -Value $kept -Encoding UTF8 -ErrorAction SilentlyContinue
-        }
-    } catch {}
-
-    # (3) Current session in-memory histories (this transient window only).
-    try { Clear-History -ErrorAction SilentlyContinue } catch {}
-    try { [Microsoft.PowerShell.PSConsoleReadLine]::ClearHistory() } catch {}
-}
-Clear-CommandHistory
-
 # ---- force TLS 1.2 (required by GitHub) ----
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
 
@@ -131,7 +91,6 @@ if (-not $isAdmin) {
     } catch {
         Write-Host (M 'elevateFail') -ForegroundColor Red
     }
-    Clear-CommandHistory   # scrub again right before this (non-admin) window returns
     return
 }
 
@@ -293,10 +252,6 @@ function Invoke-Setup([string]$script) {
 }
 
 # ================= main =================
-# Everything below runs inside try/finally so history cleanup is guaranteed on
-# every exit path: normal finish, unsupported-OS return, errors, and even when
-# a nested setup script calls exit (verified: finally still runs through iex).
-try {
 Write-Host ""
 Write-Host (M 'title') -ForegroundColor Cyan
 Write-Host ""
@@ -416,10 +371,4 @@ catch {
     Write-Host ""
     Write-Host ((M 'errRun') + $_.Exception.Message) -ForegroundColor Red
     Write-Host (M 'errHint') -ForegroundColor DarkGray
-}
-
-}
-finally {
-    # Guaranteed cleanup of PowerShell history on any exit path.
-    Clear-CommandHistory
 }
