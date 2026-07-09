@@ -37,6 +37,16 @@ $cacheRoot = Join-Path $env:TEMP 'SMBProxy'
 # latest -> no stale CDN cache; bypasses ISP blocking of github).
 $SelfUrl   = "https://gh-proxy.com/https://raw.githubusercontent.com/$Repo/$GitHubBranch/client/start-client.ps1"
 
+# ---- detect local vs remote run ----
+$LocalRun = $false
+$ClientRoot = $null
+try { $ScriptPath = $PSCommandPath } catch { $ScriptPath = $null }
+if (-not $ScriptPath) { $ScriptPath = $MyInvocation.MyCommand.Path }
+if ($ScriptPath -and (Test-Path -LiteralPath $ScriptPath -PathType Leaf) -and ($ScriptPath -like '*.ps1')) {
+    $LocalRun = $true
+    $ClientRoot = Split-Path -Parent $ScriptPath
+}
+
 # ---- localized messages: Base64(UTF-8), decoded at runtime to avoid mojibake ----
 $T = @{
     title        = 'PT09PT09PT09PT09PT0gU01CUHJveHkg5a6i5oi356uv5byV5a+8ID09PT09PT09PT09PT09'
@@ -78,10 +88,16 @@ $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIden
 if (-not $isAdmin) {
     Write-Host (M 'elevate') -ForegroundColor Yellow
     try {
-        Start-Process powershell.exe -Verb RunAs -ArgumentList @(
-            '-NoProfile','-ExecutionPolicy','Bypass','-Command',
-            "irm '$SelfUrl' | iex"
-        )
+        if ($LocalRun) {
+            Start-Process powershell.exe -Verb RunAs -ArgumentList @(
+                '-NoProfile','-ExecutionPolicy','Bypass','-File', "`"$ScriptPath`""
+            )
+        } else {
+            Start-Process powershell.exe -Verb RunAs -ArgumentList @(
+                '-NoProfile','-ExecutionPolicy','Bypass','-Command',
+                "irm '$SelfUrl' | iex"
+            )
+        }
     } catch {
         Write-Host (M 'elevateFail') -ForegroundColor Red
     }
@@ -141,6 +157,18 @@ function Test-FileSignatureOnDisk([string]$path, [string]$name) {
 
 # Download raw bytes trying each mirror until one succeeds (silent about URLs).
 function Download-Bytes([string]$rel, [bool]$includeCdn, [string]$validateName = $null) {
+    if ($LocalRun) {
+        $localRel = $rel -replace '^client[\\/]', ''
+        $localPath = Join-Path $ClientRoot $localRel
+        if (-not (Test-Path -LiteralPath $localPath)) {
+            throw "Local file not found: $localPath"
+        }
+        $data = [System.IO.File]::ReadAllBytes($localPath)
+        if ($validateName -and -not (Test-FileSignature $data $validateName)) {
+            throw "File signature validation failed: $localPath"
+        }
+        return ,$data
+    }
     foreach ($u in (Get-MirrorUrls $rel $includeCdn)) {
         $wc = $null
         try {
