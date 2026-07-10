@@ -10,16 +10,19 @@
     (which contain Chinese) are fetched as raw bytes and decoded as UTF-8
     explicitly inside this script, so their output is also fine.
 
-    Responsibilities:
+    Responsibilities (pure router; the setup script does the real work):
       1. Self-elevate (UAC) to Administrator
       2. Detect Windows edition -> route to the matching setup-client script
-      3. Fetch the setup script online and run it in memory (no file on disk)
-      4. Cache Win7/2008R2 offline plugins to a fixed temp dir (survives reboot)
-      5. No auto-start: when a reboot is required, ask the user to re-run this
-         same one-liner manually (Win+R) after rebooting. No scheduled task.
-      6. Stage detection via dependency / SMB state
-      7. When fully ready: clear cached plugins
-      8. Multi-mirror download with automatic fallback (GitHub proxies + CDN)
+      3. Online mode: download the setup script (and win7/2008 plugins) to a temp
+         dir and run it FROM DISK, then finally-clean the temp dir. Running from
+         disk keeps the setup script's own path / $PluginDir / Add-Type(SetupAPI)
+         / mode menu all working, identical to a manual local run.
+      4. Local mode: if this file is run from disk, run the sibling setup script
+         directly (works offline, no download).
+      5. Multi-mirror download with automatic fallback (GitHub proxies + CDN).
+
+    The setup script itself handles mode selection (disable/compat), dependency
+    install, adapter creation and the engine. start-client only routes + runs.
 
     Usage:
       irm https://gh-proxy.com/https://raw.githubusercontent.com/lcxxjmsg-cyber/SMBProxy/main/client/start-client.ps1 | iex
@@ -209,50 +212,41 @@ function Download-Text([string]$rel) {
     return $s
 }
 
-# ================= helpers =================
-function Clear-PluginCache {
-    if (Test-Path $cacheRoot) {
-        Remove-Item $cacheRoot -Recurse -Force -ErrorAction SilentlyContinue
-        Write-Host (M 'cacheCleared') -ForegroundColor DarkGray
-    }
-}
-function Test-SmbDisabled {
-    $s = Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Services\srvnet" -Name "Start" -ea SilentlyContinue
-    return ($s -and $s.Start -eq 4)
-}
-function Test-DepsReady {
-    if (-not (Get-HotFix -Id KB4490628 -ea SilentlyContinue)) { return $false }
-    if (-not (Get-HotFix -Id KB4474419 -ea SilentlyContinue)) { return $false }
-    $net = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\NET Framework Setup\NDP\v4\Full" -ea SilentlyContinue
-    if (-not $net -or $net.Release -lt 378389) { return $false }
-    if ($PSVersionTable.PSVersion.Major -lt 5) { return $false }
-    return $true
-}
-function Ensure-Plugins([string]$plugDir, [string[]]$plugFiles) {
-    $plugPath = Join-Path $cacheRoot $plugDir
-    New-Item -ItemType Directory -Path $plugPath -Force | Out-Null
-    Write-Host (M 'caching') -ForegroundColor Yellow
-    foreach ($f in $plugFiles) {
-        $target = Join-Path $plugPath $f
-        if (Test-Path $target) {
-            if (Test-FileSignatureOnDisk $target $f) {
-                Write-Host ((M 'skipVerified') + $f) -ForegroundColor DarkGray; continue
-            }
-            Write-Host ((M 'reDownload') + $f) -ForegroundColor Yellow
-            Remove-Item $target -Force -ErrorAction SilentlyContinue
-        }
-        Write-Host ((M 'downloading') + $f) -ForegroundColor DarkGray
-        Download-ToFile "client/$plugDir/$f" $target $false   # no CDN for big files
-    }
-}
-function Invoke-Setup([string]$script) {
+# ================= run setup script from disk =================
+# Online: download setup script (and win7/2008 plugins) to a temp dir, run from disk.
+# So the setup script's $MyInvocation path / $PluginDir / Add-Type(SetupAPI) /
+# mode menu all work exactly like a manual local run. finally cleans the temp dir.
+# Local: run the sibling script directly (already on disk, no download).
+
+$runRoot = $null   # temp dir (online mode), cleaned in finally
+
+function Invoke-SetupOnline([string]$script, [string]$plugDir, [string[]]$plugFiles) {
+    $script:runRoot = Join-Path $env:TEMP ("SMBProxyRun_" + [Guid]::NewGuid().ToString('N').Substring(0,8))
+    New-Item -ItemType Directory -Path $runRoot -Force | Out-Null
+    # download setup script
     Write-Host (M 'fetching') -ForegroundColor Yellow
-    $text = Download-Text "client/$script"
-    # In-memory run: original scripts derive plugin dir from their own path,
-    # which is empty when run via iex. Redirect it to our plugin cache dir.
-    $text = $text.Replace('Split-Path -Parent $MyInvocation.MyCommand.Path', "'$cacheRoot'")
-    Clear-Host   # wipe the bootstrap's own output so the setup menu starts clean
-    Invoke-Expression $text   # the setup script may call exit; nothing after runs
+    $setupPath = Join-Path $runRoot $script
+    $bytes = Download-Bytes "client/$script" $true
+    [System.IO.File]::WriteAllBytes($setupPath, $bytes)
+    # win7/2008: download plugins to <runRoot>\<plugDir>\ (setup finds them by relative path)
+    if ($plugDir) {
+        $pp = Join-Path $runRoot $plugDir
+        New-Item -ItemType Directory -Path $pp -Force | Out-Null
+        Write-Host (M 'caching') -ForegroundColor Yellow
+        foreach ($f in $plugFiles) {
+            Write-Host ((M 'downloading') + $f) -ForegroundColor DarkGray
+            Download-ToFile "client/$plugDir/$f" (Join-Path $pp $f) $false
+        }
+    }
+    Clear-Host
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$setupPath"
+}
+
+function Invoke-SetupLocal([string]$script) {
+    $localPath = Join-Path $ClientRoot $script
+    if (-not (Test-Path -LiteralPath $localPath)) { throw "Local script not found: $localPath" }
+    Clear-Host
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$localPath"
 }
 
 # ================= main =================
@@ -306,58 +300,30 @@ if (-not $script) {
     return
 }
 
+# win7/2008 plugin list (by arch; only downloaded in online mode)
 if ($plugDir -eq 'win7plug') {
     if ($is64) {
-        $plugFiles = @(
-            'ndp48-web.exe',
-            'windows6.1-kb4490628-x64_d3de52d6987f7c8bdc2c015dca69eac96047c76e.msu',
-            'windows6.1-kb4474419-v3-x64_b5614c6cea5cb4e198717789633dca16308ef79c.msu',
-            'Win7AndW2K8R2-KB3191566-x64.zip'
-        )
+        $plugFiles = @('ndp48-web.exe','windows6.1-kb4490628-x64_d3de52d6987f7c8bdc2c015dca69eac96047c76e.msu','windows6.1-kb4474419-v3-x64_b5614c6cea5cb4e198717789633dca16308ef79c.msu','Win7AndW2K8R2-KB3191566-x64.zip')
     } else {
-        $plugFiles = @(
-            'ndp48-web.exe',
-            'windows6.1-kb4490628-x86_3cdb3df55b9cd7ef7fcb24fc4e237ea287ad0992.msu',
-            'windows6.1-kb4474419-v3-x86_0f687d50402790f340087c576886501b3223bec6.msu',
-            'Win7-KB3191566-x86.zip'
-        )
+        $plugFiles = @('ndp48-web.exe','windows6.1-kb4490628-x86_3cdb3df55b9cd7ef7fcb24fc4e237ea287ad0992.msu','windows6.1-kb4474419-v3-x86_0f687d50402790f340087c576886501b3223bec6.msu','Win7-KB3191566-x86.zip')
     }
 } elseif ($plugDir -eq '2008r2plug') {
-    $plugFiles = @(
-        'ndp48-web.exe',
-        'windows6.1-kb4490628-x64_d3de52d6987f7c8bdc2c015dca69eac96047c76e.msu',
-        'windows6.1-kb4474419-v3-x64_b5614c6cea5cb4e198717789633dca16308ef79c.msu',
-        'Win7AndW2K8R2-KB3191566-x64.zip'
-    )
+    $plugFiles = @('ndp48-web.exe','windows6.1-kb4490628-x64_d3de52d6987f7c8bdc2c015dca69eac96047c76e.msu','windows6.1-kb4474419-v3-x64_b5614c6cea5cb4e198717789633dca16308ef79c.msu','Win7AndW2K8R2-KB3191566-x64.zip')
 }
 
-$needsPlugin = [bool]$plugDir
-$depsReady   = if ($needsPlugin) { Test-DepsReady } else { $true }
-$smbDisabled = Test-SmbDisabled
-
 Write-Host ((M 'lblScript') + $script) -ForegroundColor Green
-Write-Host ((M 'lblDeps') + $(if($depsReady){M 'depReady'}else{M 'depNeed'})) -ForegroundColor Green
-Write-Host ((M 'lblSmb') + $(if($smbDisabled){M 'smbOff'}else{M 'smbOn'})) -ForegroundColor Green
 Write-Host ""
 
+# The setup script handles everything (mode menu, deps, adapter, engine). start-client only routes+runs.
 try {
-    if ($needsPlugin -and -not $depsReady) {
-        Write-Host (M 'stageA') -ForegroundColor Magenta
-        Ensure-Plugins $plugDir $plugFiles
-        Invoke-Setup $script
-    }
-    elseif (-not $smbDisabled) {
-        Write-Host (M 'stageB') -ForegroundColor Magenta
-        Invoke-Setup $script
-    }
-    else {
-        Write-Host (M 'stageC') -ForegroundColor Magenta
-        Clear-PluginCache
-        Invoke-Setup $script
-    }
+    if ($LocalRun) { Invoke-SetupLocal $script }
+    else           { Invoke-SetupOnline $script $plugDir $plugFiles }
 }
 catch {
     Write-Host ""
     Write-Host ((M 'errRun') + $_.Exception.Message) -ForegroundColor Red
     Write-Host (M 'errHint') -ForegroundColor DarkGray
+}
+finally {
+    if ($runRoot -and (Test-Path $runRoot)) { Remove-Item $runRoot -Recurse -Force -ErrorAction SilentlyContinue }
 }
