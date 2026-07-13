@@ -217,26 +217,125 @@ Win+R → \\10.10.10.10 → 回车
 
 ### 3. 非 Windows 客户端
 
-服务端已运行即可，无需脚本，直接连接 `域名:端口`。
+只要服务端已运行，**非 Windows 系统无需任何脚本**，因为 macOS / Linux 的 SMB 客户端原生支持自定义端口，直接连 `域名:端口` 即可。
+
+> 下面的 `域名` 指服务端的公网 IP 或 DDNS 域名，`端口` 指服务端在 [1. 服务端](#1-服务端) 中设置的公网监听端口（建议 `1445`），`共享名` 指服务端上共享文件夹的名称，`用户名` / `密码` 是服务端上有权访问该共享的账户凭据。
+
+#### Windows（若不想装客户端脚本）
+
+Windows 资源管理器的 `\\` UNC 语法**不支持端口号**，所以标准做法仍是安装 SMBProxy 客户端脚本（见 [2. 客户端](#2-客户端)），装完后直接 `\\10.10.10.10` 访问。
+
+如果**临时**只想访问一次、不想装脚本，可用 `net use` 命令挂载为盘符（走本机 445，因此本机不能同时占用 445，且仍受 Windows 不能改端口限制——只有当服务端公网端口恰好是 445 时才可用）：
+
+```powershell
+# 映射到 Z 盘（服务端端口必须是 445）
+net use Z: \\域名\共享名 /user:用户名 密码
+
+# 断开
+net use Z: /delete
+```
+
+> 因此在 Windows 上想使用**非 445 端口**，请务必使用 SMBProxy 客户端脚本，这也是本项目的核心用途。
 
 #### Linux
 
-```bash
-# 挂载
-sudo mount -t cifs //域名:端口/共享名 /mnt -o user=用户名,vers=3.0
+**第 1 步：安装 cifs-utils（`mount -t cifs` 的依赖，多数发行版默认不带）**
 
-# 文件管理器直接访问
-# Nautilus / Dolphin 地址栏输入: smb://域名:端口/
+```bash
+# Debian / Ubuntu / 深度 Deepin
+sudo apt update && sudo apt install -y cifs-utils
+
+# RHEL / CentOS / Rocky / Alma / Fedora
+sudo dnf install -y cifs-utils      # 旧系统用 yum install -y cifs-utils
+
+# Arch / Manjaro
+sudo pacman -S --noconfirm cifs-utils
+
+# openSUSE
+sudo zypper install -y cifs-utils
+```
+
+**第 2 步：命令行挂载**
+
+自定义端口**不能**写在 UNC 路径里，必须用 `-o port=` 选项指定（`mount.cifs` 的 UNC 只接受 `//服务器/共享名`）。用户名、密码、端口、协议版本都通过 `-o` 传入：
+
+```bash
+# 先建挂载点
+sudo mkdir -p /mnt/smbproxy
+
+# 挂载（把 域名/共享名/端口/用户名/密码 换成你自己的）
+sudo mount -t cifs //域名/共享名 /mnt/smbproxy \
+  -o port=端口,username=用户名,password=密码,vers=3.0,uid=$(id -u),gid=$(id -g),iocharset=utf8
+
+# 卸载
+sudo umount /mnt/smbproxy
+```
+
+常用选项说明：
+
+| 选项 | 作用 |
+|------|------|
+| `port=端口` | **自定义端口**（默认 445）——这是连 SMBProxy 服务端的关键 |
+| `username=` / `password=` | 服务端共享账户的用户名 / 密码（命令行里密码不能含逗号） |
+| `vers=3.0` | SMB 协议版本，公网建议 `3.0` 及以上以支持加密；不确定可用 `vers=3` 或省略走自动协商 |
+| `uid=` / `gid=` | 让挂载后的文件归当前用户所有，否则默认 root |
+| `iocharset=utf8` | 正确显示中文文件名 |
+
+**第 3 步（推荐）：用凭据文件代替明文密码**
+
+把密码写在命令行/`fstab` 里不安全，改用受保护的凭据文件：
+
+```bash
+# 创建凭据文件
+sudo tee /etc/smbproxy-cred > /dev/null <<'EOF'
+username=用户名
+password=密码
+EOF
+sudo chmod 600 /etc/smbproxy-cred   # 仅 root 可读
+
+# 用凭据文件挂载
+sudo mount -t cifs //域名/共享名 /mnt/smbproxy \
+  -o port=端口,credentials=/etc/smbproxy-cred,vers=3.0,uid=$(id -u),gid=$(id -g),iocharset=utf8
+```
+
+**第 4 步（可选）：开机自动挂载**，编辑 `/etc/fstab` 追加一行：
+
+```fstab
+//域名/共享名  /mnt/smbproxy  cifs  port=端口,credentials=/etc/smbproxy-cred,vers=3.0,uid=1000,gid=1000,iocharset=utf8,_netdev  0  0
+```
+
+> `_netdev` 表示等网络就绪后再挂载，避免开机卡住。
+
+**图形界面（无需 cifs-utils）**：GNOME Nautilus / KDE Dolphin 地址栏直接输入，端口写在 URL 里即可，会提示输入用户名密码：
+
+```
+smb://域名:端口/共享名
 ```
 
 #### macOS
 
-```
-Finder → ⌘K → smb://域名:端口/共享名
+macOS 的 SMB 客户端原生支持在 URL 中带端口。
 
-# 或命令行:
-mount_smbfs //用户名@域名:端口/共享名 /Volumes/挂载点
 ```
+Finder → 顶部菜单“前往” → “连接服务器…”（快捷键 ⌘K）→ 输入：
+smb://域名:端口/共享名
+→ 回车后按提示输入用户名、密码
+```
+
+命令行方式（端口写在主机名后，凭据可写进 URL）：
+
+```bash
+# 先建挂载点
+mkdir -p /Volumes/smbproxy
+
+# 挂载：//用户名:密码@域名:端口/共享名
+mount_smbfs //用户名:密码@域名:端口/共享名 /Volumes/smbproxy
+
+# 卸载
+umount /Volumes/smbproxy
+```
+
+> 若用户名或密码含 `@ : /` 等特殊字符，需做 URL 编码（如 `@` → `%40`），或省略密码只写 `//用户名@域名:端口/共享名`，运行时会交互式提示输入密码。
 
 #### Android
 
