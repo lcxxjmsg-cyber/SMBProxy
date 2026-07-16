@@ -131,7 +131,7 @@
 | **macOS** | smbd | ✅ | 改 `/etc/smb.conf` → `smb ports = 1445` |
 | **Linux** | Samba (smbd) | ✅ | 改 `/etc/samba/smb.conf` → `smb ports = 1445` |
 | **Android** | 第三方 App | ✅ | 极少作为服务端 |
-| **iOS / iPadOS** | 支持 | ❌ | 猫头鹰文件管理器 |
+| **iOS / iPadOS** | 不支持 | ❌ | —— |
 
 ---
 
